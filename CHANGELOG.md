@@ -1,5 +1,16 @@
 # Changelog
 
+## r26-riscos3test (2026-10-18)
+- The title bar's frame rate stayed at 0 on the Pi (the log counted ~43):
+  the title bar is now also redrawn the classic way (Wimp_ForceRedraw of
+  its screen area, from Wimp_GetWindowOutline), and the "Frames:" log
+  line shows the title text.
+- The high resolution renderer (pcsx_rearmed_neon_enhancement_enable)
+  aborted with an alignment fault: without mmap the core's buffers came
+  from calloc (8-byte aligned) and the NEON GPU uses :128 alignment hints
+  on its enhancement buffer. psxMap now gives page-aligned memory (patch
+  0006). The test suite also runs with it on.
+
 ## r26-riscos2test (2026-10-18)
 After the first Pi log (dynarec, sound and pacing working):
 - "Frames:" timings in microseconds (UnixLib's CLOCK_MONOTONIC); they read

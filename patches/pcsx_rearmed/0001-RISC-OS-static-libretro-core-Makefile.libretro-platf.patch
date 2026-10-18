@@ -1,7 +1,7 @@
 From 0a51e35f985837ca333722351ea15e918348493b Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
-Subject: [PATCH 1/5] RISC OS: static libretro core (Makefile.libretro
+Subject: [PATCH 1/6] RISC OS: static libretro core (Makefile.libretro
  platform=riscos)
 
 GCCSDK arm-riscos-gnueabihf, UnixLib, single core: ari64 dynarec in

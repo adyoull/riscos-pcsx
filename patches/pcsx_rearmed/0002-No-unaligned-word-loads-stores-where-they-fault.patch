@@ -1,7 +1,7 @@
 From 0832554c6d51bbe383751986bcf390d481b40f36 Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
-Subject: [PATCH 2/5] No unaligned word loads/stores where they fault
+Subject: [PATCH 2/6] No unaligned word loads/stores where they fault
 
 new_dynarec: get_reg's assembler version loads regmap (not word
 aligned in struct regstat) as words: use the C version unless

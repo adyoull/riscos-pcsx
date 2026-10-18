@@ -1,0 +1,38 @@
+From f648a3feb5926a2e23f2b481769f62dbfef1d5c0 Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:10:00 +0100
+Subject: [PATCH 6/6] psxMap without mmap: page-aligned memory
+
+The NEON GPU's enhancement (high resolution) buffer is read and written
+with :128 alignment hints; calloc gives 8-byte alignment, which faults.
+Use posix_memalign (page aligned, as mmap) where there is one.
+---
+ libpcsxcore/psxmem.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/libpcsxcore/psxmem.c b/libpcsxcore/psxmem.c
+index a81dcaa8..b235d82e 100644
+--- a/libpcsxcore/psxmem.c
++++ b/libpcsxcore/psxmem.c
+@@ -50,8 +50,18 @@ static void * psxMapDefault(unsigned long addr, size_t size,
+ 	void *ptr;
+ #if !P_HAVE_MMAP
+ 	*can_retry_addr = 0;
++#if P_HAVE_POSIX_MEMALIGN
++	// page aligned, as mmap gives: the NEON GPU's enhancement buffer is
++	// accessed with :128 alignment hints, which fault on 8-aligned calloc
++	// memory
++	if (posix_memalign(&ptr, 4096, size) != 0)
++		return MAP_FAILED;
++	memset(ptr, 0, size);
++	return ptr;
++#else
+ 	ptr = calloc(1, size);
+ 	return ptr ? ptr : MAP_FAILED;
++#endif
+ #else
+ 	int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ 
+-- 
+2.43.0
+

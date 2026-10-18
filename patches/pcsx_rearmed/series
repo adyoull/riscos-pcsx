@@ -3,3 +3,4 @@
 0003-RISC-OS-32bpp-frames-as-RISC-OS-sprite-images-TBGR.patch
 0004-RISC-OS-.cue-files-naming-files-with-spaces.patch
 0005-RISC-OS-native-desktop-frontend.patch
+0006-psxMap-without-mmap-page-aligned-memory.patch

@@ -1,7 +1,7 @@
-From 3fa5b003f5879c02fdf73f4d92ee8816e3b1c799 Mon Sep 17 00:00:00 2001
+From 63b65b47b82fb3128d4eb48f2f80c84b9a273a03 Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
-Subject: [PATCH 5/5] RISC OS: native desktop frontend
+Subject: [PATCH 5/6] RISC OS: native desktop frontend
 
 A Wimp task (no SDL): icon bar, game window, full screen window,
 menus, drag and drop of disc images, frames plotted from a 32bpp
@@ -12,10 +12,10 @@ USB game pads through USBJoystick's API, save states, Choices.
  frontend/riscos/choices.c     |  93 ++++
  frontend/riscos/host.c        | 829 +++++++++++++++++++++++++++++++
  frontend/riscos/keys.c        |  60 +++
- frontend/riscos/plat_riscos.c | 463 ++++++++++++++++++
+ frontend/riscos/plat_riscos.c | 463 +++++++++++++++++
  frontend/riscos/rofe.h        |  98 ++++
- frontend/riscos/wimp.c        | 892 ++++++++++++++++++++++++++++++++++
- 6 files changed, 2435 insertions(+)
+ frontend/riscos/wimp.c        | 900 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 2443 insertions(+)
  create mode 100644 frontend/riscos/choices.c
  create mode 100644 frontend/riscos/host.c
  create mode 100644 frontend/riscos/keys.c
@@ -1598,10 +1598,10 @@ index 00000000..546ce93e
 +#endif
 diff --git a/frontend/riscos/wimp.c b/frontend/riscos/wimp.c
 new file mode 100644
-index 00000000..a2c7352c
+index 00000000..32fc0a12
 --- /dev/null
 +++ b/frontend/riscos/wimp.c
-@@ -0,0 +1,892 @@
+@@ -0,0 +1,900 @@
 +/*
 + * !PCSX's desktop: a Wimp task with an icon bar icon, a game window and a
 + * borderless full screen window, built in code (no Templates).
@@ -1883,8 +1883,16 @@ index 00000000..a2c7352c
 +	else
 +		snprintf(title, sizeof title, "PCSX: %s%s%s%s%s", host_game_name(),
 +		         paused ? " (paused)" : "", fps, msg ? ": " : "", msg ? msg : "");
-+	if (win_desk >= 0 && strcmp(old, title) != 0)
++	if (win_desk >= 0 && strcmp(old, title) != 0) {
++		int o[5], st[9];
 +		_swix(Wimp_ForceRedraw, _INR(0, 2), win_desk, TASK_WORD, 3);   /* title bar */
++		/* and the classic way: the strip between the work area's top and
++		   the window's outline, in screen coordinates */
++		o[0] = st[0] = win_desk;
++		if (_swix(Wimp_GetWindowOutline, _IN(1), o) == NULL &&
++		    _swix(Wimp_GetWindowState, _IN(1), st) == NULL && (st[8] & (1 << 16)))
++			_swix(Wimp_ForceRedraw, _INR(0, 4), -1, o[1], st[4], o[3], o[4]);
++	}
 +}
 +
 +static int create_window(int full)
@@ -2187,10 +2195,10 @@ index 00000000..a2c7352c
 +	if (!log_frames || (int)(now - t_stats) < 500)
 +		return;
 +	if (frames_run)
-+		plat_log("Frames: %u run (%.2f ms each), %u shown (%.2f ms each), %u polls, sound queued %d\n",
++		plat_log("Frames: %u run (%.2f ms each), %u shown (%.2f ms each), %u polls, sound queued %d; title \"%s\"\n",
 +		         frames_run, run_us / 1000.0 / frames_run, frames_shown,
 +		         frames_shown ? show_us / 1000.0 / frames_shown : 0.0, polls,
-+		         plat_audio_queued());
++		         plat_audio_queued(), title);
 +	frames_run = frames_shown = run_us = show_us = polls = 0;
 +	t_stats = now;
 +}

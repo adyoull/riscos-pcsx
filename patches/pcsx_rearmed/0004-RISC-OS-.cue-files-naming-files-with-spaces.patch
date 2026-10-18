@@ -1,7 +1,7 @@
 From c7bc2b4c30ef2afe3677d067d87e2d1433a3fc86 Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
-Subject: [PATCH 4/5] RISC OS: .cue files naming files with spaces
+Subject: [PATCH 4/6] RISC OS: .cue files naming files with spaces
 
 RISC OS filing systems hold a space in a name as a hard space (0xA0):
 try that when the name in the .cue isn't found.
