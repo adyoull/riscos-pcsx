@@ -28,7 +28,9 @@ Games library
 Clicking !PCSX's icon bar icon opens the games library (Adjust opens the
 game's window). Drag folders of disc images into it: PCSX looks through
 them, and the folders inside them, for games, and lists each one once (a
-.cue and its .bin are one game, so are the discs in an .m3u). Every game
+.cue and its .bin are one game, so are the discs in an .m3u; a zip or 7z
+with a game in it is one too, and its serial is read while the computer
+is otherwise idle). Every game
 you play is added too, and the five you played last are at the top.
 
 Each game shows its title (the file's name), its region and serial (read
@@ -65,6 +67,19 @@ or double-click it in the library. PCSX reads:
   .iso, .img
   .m3u              (a list of discs for multi-disc games)
   .exe              (PlayStation programs, e.g. homebrew)
+  .zip, .7z         any of these, packed (see below)
+
+Zip and 7z files: PCSX unpacks the game into <Wimp$ScrapDir>.PCSXGame
+(the window's title shows how far it has got; close the window to stop),
+plays it from there, and deletes it when you close the game, play
+another, or quit. A CD's worth takes a little while to unpack, and needs
+that much free disc space; playing the same game again straight away
+doesn't unpack it again. The desktop keeps running while it unpacks.
+Save states, memory cards and per-game settings go by the archive's name.
+Zip: stored, deflated or LZMA (zip64 too). 7z: LZMA or LZMA2 (7-Zip's
+usual settings), solid or not; others only in small blocks. Encrypted
+archives aren't supported. PCSX opens zips itself, so it doesn't matter
+whether SparkFS is loaded.
 
 A file with a space in its name is shown by RISC OS with a hard space;
 .cue files that name such files are understood.

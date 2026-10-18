@@ -2,7 +2,8 @@
  * wimp.c against riscos-crossdev's Fake RISC OS, with the Wimp SWIs it
  * uses faked here and host.c replaced by a stub: start-up, the window
  * opened where it should be, the sprite and how it's plotted, dragging a
- * file in, the keys (F11, Escape, F8), the menus, Quit.
+ * file in, the keys (F11, Escape, F8), the menus, a zipped game unpacked
+ * and played (and another stopped part way), Quit.
  *
  * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
  */
@@ -33,7 +34,17 @@ int host_init(const char *s, const char *sv, const char *st, host_fb_func fb)
 void host_shutdown(void) {}
 static int nloads;
 static char loadlist[4][512];
-int host_load_game(const char *p) { snprintf(loaded_path, sizeof loaded_path, "%s", p); if (nloads < 4) snprintf(loadlist[nloads++], 512, "%s", p); loaded = 1; return 1; }
+static char name_from[512];
+int host_load_game_as(const char *p, const char *from)
+{
+	snprintf(loaded_path, sizeof loaded_path, "%s", p);
+	snprintf(name_from, sizeof name_from, "%s", from);
+	if (nloads < 4)
+		snprintf(loadlist[nloads++], 512, "%s", p);
+	loaded = 1;
+	return 1;
+}
+int host_load_game(const char *p) { return host_load_game_as(p, p); }
 const char *host_disc_serial(void) { return ""; }
 void host_unload_game(void) { loaded = 0; }
 int host_game_loaded(void) { return loaded; }
@@ -108,6 +119,8 @@ static const _kernel_oserror *other(int swi, int r[10])
 static char started[256];
 static int sprite_ok, plots, plot_x, plot_y, plot_scale[4], last_scale[4], last_x;
 static const int *menu_last;
+static int saw_unpacking, unpacked_seen, paused_at_close = -1;
+#define SCRAP "/<Wimp$ScrapDir>/PCSXGame"
 
 /* scripted events for Wimp_Poll */
 struct evt { int reason; int b[64]; };
@@ -160,6 +173,12 @@ static const _kernel_oserror *wimp(int swi, int r[10])
 			if (f) fclose(f);
 			CHECK(nloads == 1, "the late file isn't loaded before it opens");
 		}
+		if (nwin && win[0].block[18] && strstr((char *)win[0].block[18], "unpacking"))
+			saw_unpacking++;
+		if (iscript == 50)          /* the second zip is being unpacked */
+			unpacked_seen = fopen(SCRAP "/Z.cue", "r") == NULL;
+		if (iscript == 32)
+			paused_at_close = paused_audio;
 		if (iscript < nscript) {
 			memcpy((int *)r[1], script[iscript].b, sizeof script[iscript].b);
 			/* y = -12345: 100 OS units below the library window's top */
@@ -252,6 +271,7 @@ static const _kernel_oserror *readmodevar(int swi, int r[10])
 	return NULL;
 }
 
+
 static const _kernel_oserror *spriteop(int swi, int r[10])
 {
 	const int *area = (const int *)r[1], *s = (const int *)r[2];
@@ -265,14 +285,22 @@ static const _kernel_oserror *spriteop(int swi, int r[10])
 		plot_x = r[3];
 		plot_y = r[4];
 		memcpy(plot_scale, sc, 16);
-	} else
+	} else if (iscript <= 26) {  /* up to Escape: the full screen plots */
 		memcpy(last_scale, sc, 16);
-	last_x = r[3];
+		last_x = r[3];
+	}
 	CHECK(r[5] == 0 && r[7] == 0, "plain plot, no table");
 	return NULL;
 }
 
 static const _kernel_oserror *osbyte(int swi, int r[10]) { (void)swi; r[1] = 0; return NULL; }
+static const _kernel_oserror *fscontrol(int swi, int r[10])
+{
+	(void)swi;
+	CHECK(r[0] == 55 && !strcmp((char *)r[1], "<Wimp$ScrapDir>"), "free space where it unpacks");
+	r[0] = 0; r[1] = 2;            /* 8 GB */
+	return NULL;
+}
 
 int main(void)
 {
@@ -298,11 +326,20 @@ int main(void)
 	fake_swi(OS_ReadModeVariable, "OS_ReadModeVariable", readmodevar);
 	fake_swi(OS_SpriteOp, "OS_SpriteOp", spriteop);
 	fake_swi(OS_Byte, "OS_Byte", osbyte);
+	fake_swi(0x29, "OS_FSControl", fscontrol);
 	/* wimp.c sends stderr to the log: the results end up there too */
 	/* the dropped file: present (an archive that's slow to open is tested by
 	   the delay below) */
 	system("rm -rf '/tmp/pcsxtest' '/<Choices$Write>' && mkdir -p '/tmp/pcsxtest/ADFS::4/$/Games' "
 	       "'/<Choices$Write>/PCSX/games' && touch '/tmp/pcsxtest/ADFS::4/$/Games/Lib.cue'");
+	/* two zipped games, outside the library's folder */
+	system("rm -rf '" SCRAP "' && mkdir -p /tmp/pcsxtest/ADFS::4/$/Zips && python3 -c \""
+	       "import zipfile,os\n"
+	       "for n in ('Zipped','Second'):\n"
+	       " z=zipfile.ZipFile('/tmp/pcsxtest/ADFS::4/$/Zips/'+n+'.zip','w',zipfile.ZIP_DEFLATED)\n"
+	       " z.writestr('Z.cue','FILE \\\"Z.bin\\\" BINARY\\n')\n"
+	       " z.writestr('Z.bin',os.urandom(3<<20))\n"
+	       " z.close()\"");
 	setenv("PCSX$Log", getenv("TEST_LOG") ? getenv("TEST_LOG") : "/tmp/test_wimp.log", 1);
 
 	/* the library window is open at the start (no game given) */
@@ -350,13 +387,36 @@ int main(void)
 	memset(b, 0, sizeof b); b[0] = 1; b[1] = -1; add_event(9, b, 2);
 	/* 8: the close icon: closed, sound paused */
 	memset(b, 0, sizeof b); b[0] = 0x1000; add_event(3, b, 1);
+	/* 9: a zipped game onto the icon bar: unpacked on null events, played */
+	memset(b, 0, sizeof b);
+	b[0] = 256; b[1] = 0x99; b[2] = 0x55; b[4] = 3; b[5] = -2; b[10] = 0xA91;
+	strcpy((char *)&b[11], "ADFS::4.$.Zips.Zipped/zip");
+	add_event(17, b, 30);
+	for (i = 0; i < 16; i++)
+		add_event(0, b, 0);
+	/* 10: another: it replaces the first, and closing the window stops it */
+	memset(b, 0, sizeof b);
+	b[0] = 256; b[1] = 0x99; b[2] = 0x55; b[4] = 3; b[5] = -2; b[10] = 0xA91;
+	strcpy((char *)&b[11], "ADFS::4.$.Zips.Second/zip");
+	add_event(17, b, 30);
+	memset(b, 0, sizeof b); b[0] = 0x1000; add_event(3, b, 1);
 
 	CHECK(wimp_main(1, argv) == 0, "runs and quits");
+	fprintf(stderr, "script: %d events, %d used\n", nscript, iscript);
+	CHECK(nloads == 3 && !strcmp(loadlist[2], SCRAP "/Z.cue"), "the zipped game played, unpacked");
+	CHECK(!strcmp(name_from, "/tmp/pcsxtest/ADFS::4/$/Zips/Zipped.zip"), "named after its zip");
+	CHECK(saw_unpacking > 0, "the title said it was unpacking");
+	CHECK(unpacked_seen, "the first game's files deleted when the second was dropped");
+	{
+		FILE *f = fopen(SCRAP, "r");
+		CHECK(f == NULL, "unpacked files deleted at the end");
+		if (f) fclose(f);
+	}
 
 	CHECK(nwin == 3, "three windows: desktop, full screen, library");
 	CHECK(win[2].block[7] == (int)0xBF000002, "library window: scroll bar, size icon");
 	CHECK(textops > 0, "library rows drawn");
-	CHECK(nloads == 2 && strstr(loadlist[0], "/Games/Lib.cue") && strstr(loadlist[1], "/Games/Tri.cue"),
+	CHECK(nloads >= 2 && strstr(loadlist[0], "/Games/Lib.cue") && strstr(loadlist[1], "/Games/Tri.cue"),
 	      "the library's game played, then the dropped one");
 	{
 		FILE *f = fopen("/<Choices$Write>/PCSX/games/Lib", "r");
@@ -370,18 +430,17 @@ int main(void)
 		f = fopen("/<Choices$Write>/PCSX/Library", "r");
 		found = 0;
 		while (f && fgets(line, sizeof line, f))
-			if (strstr(line, "folder: /tmp/pcsxtest/ADFS::4/$/Games") || strstr(line, "Tri.cue"))
+			if (strstr(line, "folder: /tmp/pcsxtest/ADFS::4/$/Games") || strstr(line, "Tri.cue") ||
+			    strstr(line, "Zips/Zipped.zip"))
 				found++;
 		if (f) fclose(f);
-		CHECK(found == 2, "library file: the folder, and the dropped game as played");
+		CHECK(found == 3, "library file: the folder, and the dropped games as played (the zip, not what was in it)");
 	}
 	CHECK(win[0].block[7] == (int)0x87000002, "desktop window: title, back, close, movable");
 	CHECK((win[0].block[14] & 0x100) && win[0].block[18] != 0, "indirected title");
 	CHECK(win[1].block[7] == (int)0x80000020, "full screen window: no furniture");
 	CHECK(iconbar_icons == 1, "icon bar icon");
-	CHECK(strcmp(loaded_path, "/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue") == 0, "dropped file, Unix form");
-	if (strcmp(loaded_path, "/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue"))
-		fprintf(stderr, "loaded %s\n", loaded_path);
+	CHECK(strcmp(loadlist[1], "/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue") == 0, "dropped file, Unix form");
 	/* scale: 1920x1080 -> 3 (960x720 px leaves 160) -> 1920x1440 OS units */
 	CHECK(win[0].ext[2] == 1920 && win[0].ext[1] == -1440, "extent: 320x240 x3 at eig 1");
 	CHECK(win[0].vis[2] - win[0].vis[0] == 1920 && win[0].vis[3] - win[0].vis[1] == 1440,
@@ -408,7 +467,7 @@ int main(void)
 	CHECK(processed == 1, "other keys passed on");
 	CHECK(resets == 1, "menu Reset");
 	CHECK(menus_made >= 1, "menu opened");
-	CHECK(!win[0].open && paused_audio == 1, "closed: sound paused");
+	CHECK(!win[0].open && paused_at_close == 1 && paused_audio == 1, "closed: sound paused");
 	CHECK(closed_down, "Wimp_CloseDown");
 	return fake_done("test_wimp");
 }

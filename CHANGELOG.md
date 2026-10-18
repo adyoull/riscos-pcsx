@@ -1,5 +1,32 @@
 # Changelog
 
+## r26-riscos6test (2026-10-18)
+- Games in .zip and .7z files: dropped on PCSX or played from the library,
+  they're unpacked into <Wimp$ScrapDir>.PCSXGame about a megabyte per
+  null event (the desktop keeps multitasking; the title shows the
+  percentage; closing the window stops it), played from there, and
+  deleted when the game is closed or replaced, or PCSX quits (and at
+  start-up, after a crash). Free space is checked first. Playing the same
+  archive again doesn't unpack it again.
+- Zip: stored, deflate (the core's miniz), LZMA, zip64. 7z: LZMA, LZMA2
+  and copy streamed (any size, solid or not), other methods and filters
+  in blocks up to 8 MB (LZMA SDK 26.04, public domain, frontend/riscos/
+  lzma). CRCs checked. Names RISC OS can't have are changed, and the
+  .cue/.m3u inside changed to match.
+- Save states, memory cards, settings and the library entry go by the
+  archive's name.
+- The library lists archives with a game in them; their serials (and so
+  covers by serial) are read while idle, one archive per poll, decoding
+  only up to SYSTEM.CNF.
+- Zips are files to PCSX even with SparkFS loaded (UnixLib's
+  __feature_imagefs_is_file).
+- Raw .bin sectors are recognised by the sync pattern (not only the
+  file's size) when reading serials.
+- The C heap may grow to 256 MB (for 7z dictionaries).
+- Tests: tests/archive (109 checks, x86 with ASan/UBSan and ARM under
+  the alignment trap; zips from Python, 7z from 7-Zip's 7zr); test_wimp
+  196 (a zip unpacked and played, a second one cancelled part way).
+
 ## r26-riscos5test (2026-10-18)
 - Games library window (the icon bar icon opens it; Adjust opens the game):
   folders dragged in are scanned (subfolders too; a .cue's .bin and an

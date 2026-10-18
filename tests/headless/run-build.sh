@@ -12,6 +12,7 @@ make -f Makefile.libretro platform=riscos CROSS=arm-linux-gnueabihf- RISCOS_DYNA
 FE=frontend/riscos
 CF="-O2 -g -marm -mfpu=neon -mfloat-abi=hard -mno-unaligned-access -Wall -I deps/libretro-common/include -I $FE"
 arm-linux-gnueabihf-gcc $CF -no-pie -o "$OUT/headless" \
-  "$HERE/headless.c" $FE/host.c $FE/choices.c $FE/keys.c $FE/library.c \
+  -I deps/libchdr/deps/miniz-3.1.2 -DMINIZ_NO_STDIO -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS \
+  "$HERE/headless.c" $FE/host.c $FE/choices.c $FE/keys.c $FE/library.c $FE/archive.c $FE/lzma/*.c \
   pcsx_rearmed_libretro_riscos.a -lm -lpthread
 echo "built $OUT/headless"

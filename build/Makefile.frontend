@@ -1,15 +1,25 @@
 # Builds !RunImage: the native frontend + the core archive.
 # make -f Makefile.frontend SRC=<pcsx_rearmed tree> OUT=<dir> CORE=<core .a>
 CC = arm-riscos-gnueabihf-gcc
+MINIZ = $(SRC)/deps/libchdr/deps/miniz-3.1.2
 CFLAGS = -DROFE_VERSION=\"$(VERSION)\" -O2 -marm -mtune=cortex-a72 -mfpu=neon -mfloat-abi=hard \
 	-fstack-clash-protection -Wall -Wno-unused-function \
 	-I$(SRC)/deps/libretro-common/include -I$(SRC)/frontend/riscos
-FE = host choices keys plat_riscos wimp library libwin
-OBJS = $(FE:%=$(OUT)/fe_%.o)
+# archive.c uses the core's miniz (built with these)
+MZFLAGS = -I$(MINIZ) -DMINIZ_NO_STDIO -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
+FE = host choices keys plat_riscos wimp library libwin archive
+# the LZMA SDK's 7z reader and decoders (public domain)
+LZMA = 7zArcIn 7zBuf 7zCrc 7zCrcOpt 7zDec 7zStream Bcj2 Bra Bra86 BraIA64 CpuArch Delta Lzma2Dec LzmaDec
+OBJS = $(FE:%=$(OUT)/fe_%.o) $(LZMA:%=$(OUT)/lz_%.o)
+HDRS = $(wildcard $(SRC)/frontend/riscos/*.h)
 
 $(OUT)/pcsx.elf: $(OBJS) $(CORE)
 	$(CC) $(CFLAGS) -static -o $@ $(OBJS) $(CORE) -lm
 
-$(OUT)/fe_%.o: $(SRC)/frontend/riscos/%.c $(SRC)/frontend/riscos/rofe.h $(SRC)/frontend/riscos/ui.h $(SRC)/frontend/riscos/library.h
+$(OUT)/fe_%.o: $(SRC)/frontend/riscos/%.c $(HDRS)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(MZFLAGS) -c -o $@ $<
+
+$(OUT)/lz_%.o: $(SRC)/frontend/riscos/lzma/%.c
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -c -o $@ $<

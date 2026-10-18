@@ -50,7 +50,8 @@ Unset PCSX$LogOn
 
 | --- Memory -----------------------------------------------------------
 | The program and the dynamic recompiler's 16 MB code cache are in the
-| WimpSlot; the C heap goes in a dynamic area ("PCSX Heap").
+| WimpSlot; the C heap goes in a dynamic area ("PCSX Heap"), which grows
+| past 100 MB only to unpack a 7z made with a big dictionary.
 WimpSlot -min 28000K -max 28000K
 
 Run <PCSX$Dir>.!RunImage %*0

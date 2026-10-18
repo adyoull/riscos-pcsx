@@ -31,7 +31,7 @@ set +o pipefail   # (head closes its pipe early)
   echo "Licences of the code in !PCSX besides PCSX ReARMed's own (GPL, see COPYING)"
   echo
   echo "=== libchdr (deps/libchdr) ==="; cat "$SRC/deps/libchdr/LICENSE.txt"; echo
-  echo "=== LZMA SDK (deps/libchdr/deps/lzma) ==="; cat "$SRC/deps/libchdr/deps/lzma-26.02/LICENSE"; echo
+  echo "=== LZMA SDK (deps/libchdr/deps/lzma; frontend/riscos/lzma, 7-Zip 26.04, for .7z files) ==="; cat "$SRC/deps/libchdr/deps/lzma-26.02/LICENSE"; echo
   echo "=== zstd decompressor (deps/libchdr/deps/zstd) ==="
   sed -n '/Copyright (c) Meta/,/^ \*\//p' "$SRC/deps/libchdr/deps/zstd-1.5.7/zstddeclib.c" | head -12; echo
   echo "=== miniz (deps/libchdr/deps/miniz) ==="

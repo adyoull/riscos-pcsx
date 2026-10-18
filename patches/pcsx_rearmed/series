@@ -5,3 +5,4 @@
 0005-RISC-OS-native-desktop-frontend.patch
 0006-psxMap-without-mmap-page-aligned-memory.patch
 0007-RISC-OS-games-library-window.patch
+0008-RISC-OS-play-games-in-.zip-and-.7z-files.patch

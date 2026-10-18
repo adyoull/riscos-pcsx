@@ -28,5 +28,7 @@ touch "$T/discs/disc1.cue" "$T/discs/disc2.cue" "$T/discs/Homebrew.exe" "$T/disc
 touch "$T/states/Game_One/0" "$T/states/Game_One/3"
 FE=$SRC/frontend/riscos
 gcc -g -O1 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -fsanitize=address,undefined -I"$FE" \
-  -o "$T/test_library" "$HERE/test_library.c" "$FE/library.c"
+  -I"$SRC/deps/libchdr/deps/miniz-3.1.2" -DMINIZ_NO_STDIO -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS \
+  -o "$T/test_library" "$HERE/test_library.c" "$FE/library.c" "$FE/archive.c" "$FE"/lzma/*.c \
+  "$SRC/deps/libchdr/deps/miniz-3.1.2/miniz.c"
 "$T/test_library" "$T" 2>&1 | grep -v "^Library:"

@@ -5,6 +5,7 @@ SRC=$1; RCD=$2; T=$3; HERE=$(cd "$(dirname "$0")" && pwd)
 export PATH=$RCD/toolchain/env/bin:$PATH
 "$HERE/fake/run.sh" "$SRC" "$RCD"
 "$HERE/library/run.sh" "$SRC"
+"$HERE/archive/run.sh" "$SRC" "${Z7R:-}"
 NEON_ALIGN=$RCD/checks/neon-align.py "$HERE/headless/run-build.sh" "$SRC" /tmp/pcsx-hl
 "$HERE/headless/suite.sh" /tmp/pcsx-hl/headless "$T" 300 /tmp/pcsx-suite
 "$HERE/headless/suite.sh" /tmp/pcsx-hl/headless "$T" 300 /tmp/pcsx-suite-enh pcsx_rearmed_neon_enhancement_enable=enabled
