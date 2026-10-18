@@ -23,10 +23,42 @@ Requirements
   PCSX or from your boot sequence.
 
 
+Games library
+-------------
+Clicking !PCSX's icon bar icon opens the games library (Adjust opens the
+game's window). Drag folders of disc images into it: PCSX looks through
+them, and the folders inside them, for games, and lists each one once (a
+.cue and its .bin are one game, so are the discs in an .m3u). Every game
+you play is added too, and the five you played last are at the top.
+
+Each game shows its title (the file's name), its region and serial (read
+from the disc: SLES/SCES = PAL, SLUS/SCUS = NTSC-U, SLPS/SCPS = NTSC-J),
+when you last played it, and how many save states it has.
+
+Double-click a game, or select it and press Return, to play it. The
+library's menu has:
+  Play
+  Game settings   High resolution, Dynamic recompiler, Built-in BIOS
+                  only, Full screen, Pad 1 type: kept for that game only
+                  (in <Choices$Write>.PCSX.games) and used whenever it
+                  starts; "Use the usual settings" forgets them
+  Remove from library
+  Sort            by name or last played first
+  Rescan folders  after adding or removing games
+  Folders         remove a folder (its games go, unless played)
+  Show covers
+
+Covers are JPEG pictures, drawn by RISC OS (SpriteExtend). PCSX uses, in
+this order: a JPEG with the disc's name next to the disc (Game/jpg beside
+Game/cue), one in a "covers" folder beside it, one in
+<Choices$Write>.PCSX.covers named after the serial (SLES02574/jpg), or
+after the disc's name. Square-ish pictures of about 200 pixels look best.
+
+
 Playing
 -------
-Double-click !PCSX, then drag a disc image onto the icon bar icon or the
-window. PCSX reads:
+Drag a disc image onto the icon bar icon, the library or the game window,
+or double-click it in the library. PCSX reads:
   .cue with .bin    (the usual rip of a CD; keep them together)
   .chd              (compressed, from MAME's chdman)
   .pbp              (PSP "eboot" images)

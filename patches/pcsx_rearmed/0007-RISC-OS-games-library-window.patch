@@ -1,0 +1,1874 @@
+From afe38e675868561152f8b071b24a3c833001de04 Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:40:00 +0100
+Subject: [PATCH 7/7] RISC OS: games library window
+
+Folders scanned for games (each listed once), played games added,
+recently played at the top; covers (JPEG, SpriteExtend), region and
+serial from SYSTEM.CNF, last played, save states; per-game settings
+layered over Choices when a game starts.
+---
+ frontend/riscos/host.c    |  41 ++-
+ frontend/riscos/library.c | 653 ++++++++++++++++++++++++++++++++++
+ frontend/riscos/library.h |  67 ++++
+ frontend/riscos/libwin.c  | 715 ++++++++++++++++++++++++++++++++++++++
+ frontend/riscos/rofe.h    |   5 +-
+ frontend/riscos/ui.h      |  53 +++
+ frontend/riscos/wimp.c    | 129 +++++--
+ 7 files changed, 1613 insertions(+), 50 deletions(-)
+ create mode 100644 frontend/riscos/library.c
+ create mode 100644 frontend/riscos/library.h
+ create mode 100644 frontend/riscos/libwin.c
+ create mode 100644 frontend/riscos/ui.h
+
+diff --git a/frontend/riscos/host.c b/frontend/riscos/host.c
+index 5dd4f71c..7fb2a863 100644
+--- a/frontend/riscos/host.c
++++ b/frontend/riscos/host.c
+@@ -528,21 +528,21 @@ static void make_dirs(const char *path)
+ }
+ 
+ /* The leaf name without its extension (Unix form: "/a/b/Game.cue"). */
++static char game_title[128];
++
+ static void set_game_name(const char *path)
+ {
++	/* files are named after a safe version of it (no spaces, dots...) */
+ 	const char *leaf = strrchr(path, '/');
+-	char *dot;
+-	snprintf(game_name, sizeof game_name, "%s", leaf ? leaf + 1 : path);
+-	dot = strrchr(game_name, '.');
+-	if (dot && dot != game_name)
+-		*dot = 0;
+-	/* RISC OS names can't hold these; keep state file names simple */
+-	for (dot = game_name; *dot; dot++)
+-		if (*dot == '.' || *dot == ':' || *dot == '$' || *dot == '&' ||
+-		    *dot == '@' || *dot == '^' || *dot == '%' || *dot == '\\' ||
+-		    *dot == '#' || *dot == '*' || *dot == '"' || *dot == '|' ||
+-		    *dot == ' ' || (unsigned char)*dot == 0xA0 || *dot == '/')
+-			*dot = '_';
++	char *d;
++	rofe_safe_name(path, game_name, sizeof game_name);
++	snprintf(game_title, sizeof game_title, "%s", leaf ? leaf + 1 : path);
++	d = strrchr(game_title, '.');
++	if (d && d != game_title)
++		*d = 0;
++	for (d = game_title; *d; d++)
++		if ((unsigned char)*d == 0xA0 || *d == '_')
++			*d = ' ';
+ }
+ 
+ static int read_file(const char *path, void *buf, size_t size)
+@@ -716,7 +716,22 @@ int host_game_loaded(void)
+ 
+ const char *host_game_name(void)
+ {
+-	return game_name;
++	return game_title;
++}
++
++extern char CdromId[10];      /* libpcsxcore/misc.c: the disc's serial */
++
++const char *host_disc_serial(void)
++{
++	static char id[16];
++	int i, o = 0;
++	if (!game_loaded)
++		return "";
++	for (i = 0; i < 10 && CdromId[i] && o < 15; i++)
++		if (CdromId[i] != ' ')
++			id[o++] = CdromId[i];
++	id[o] = 0;
++	return id;
+ }
+ 
+ void host_reset(void)
+diff --git a/frontend/riscos/library.c b/frontend/riscos/library.c
+new file mode 100644
+index 00000000..14b12515
+--- /dev/null
++++ b/frontend/riscos/library.c
+@@ -0,0 +1,653 @@
++/*
++ * !PCSX's games library (see library.h).
++ *
++ * The library file is text, one line each:
++ *   folder: PATH
++ *   game: PATH<tab>NAME<tab>SERIAL<tab>LAST<tab>PLAYS<tab>SOURCE
++ * Scanning finds .cue .chd .pbp .iso .img .m3u .exe files. A .bin or .img
++ * in a folder that has a .cue is taken to belong to the .cue, and discs
++ * named in an .m3u to belong to the .m3u, so each game is listed once.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <ctype.h>
++#include <dirent.h>
++#include <time.h>
++#include <errno.h>
++#include <sys/stat.h>
++#include "library.h"
++#include "rofe.h"
++
++static char lib_file[512], covers_dir[512], settings_dir[512], states_dir[512];
++static char folders[LIB_MAX_FOLDERS][512];
++static int nfolders;
++static struct game *games;
++static int ngames;
++static int sort_mode = SORT_NAME;
++
++void library_init(const char *file, const char *covers, const char *settings,
++                  const char *states)
++{
++	snprintf(lib_file, sizeof lib_file, "%s", file);
++	snprintf(covers_dir, sizeof covers_dir, "%s", covers);
++	snprintf(settings_dir, sizeof settings_dir, "%s", settings);
++	snprintf(states_dir, sizeof states_dir, "%s", states);
++	if (games == NULL)
++		games = calloc(LIB_MAX_GAMES, sizeof *games);
++	ngames = nfolders = 0;
++}
++
++/* ---- names ---- */
++
++static const char *leaf(const char *path)
++{
++	const char *s = strrchr(path, '/');
++	return s ? s + 1 : path;
++}
++
++static const char *ext(const char *path)
++{
++	const char *l = leaf(path), *d = strrchr(l, '.');
++	return d ? d : "";
++}
++
++/* A file name made safe for RISC OS (no . : $ etc., no spaces), as the
++   save states folder is named (host.c uses the same). */
++void rofe_safe_name(const char *path, char *out, int len)
++{
++	char *d;
++	snprintf(out, len, "%s", leaf(path));
++	d = strrchr(out, '.');
++	if (d && d != out)
++		*d = 0;
++	for (d = out; *d; d++)
++		if (strchr(".:$&@^%\\#*\"|/ ", *d) || (unsigned char)*d == 0xA0)
++			*d = '_';
++}
++
++static void display_name(const char *path, char *out, int len)
++{
++	char *d;
++	snprintf(out, len, "%s", leaf(path));
++	d = strrchr(out, '.');
++	if (d && d != out)
++		*d = 0;
++	for (d = out; *d; d++)
++		if ((unsigned char)*d == 0xA0 || *d == '_')
++			*d = ' ';
++}
++
++void library_key(const struct game *g, char *buf, int len)
++{
++	if (g->serial[0])
++		snprintf(buf, len, "%s", g->serial);
++	else
++		rofe_safe_name(g->path, buf, len);
++}
++
++const char *library_region(const char *s)
++{
++	if (s == NULL || strlen(s) < 4)
++		return "";
++	if (!strncasecmp(s, "SLES", 4) || !strncasecmp(s, "SCES", 4) ||
++	    !strncasecmp(s, "SLED", 4) || !strncasecmp(s, "SCED", 4))
++		return "PAL";
++	if (!strncasecmp(s, "SLUS", 4) || !strncasecmp(s, "SCUS", 4) ||
++	    !strncasecmp(s, "SLUD", 4) || !strncasecmp(s, "LSP", 3))
++		return "NTSC-U";
++	if (!strncasecmp(s, "SLPS", 4) || !strncasecmp(s, "SLPM", 4) ||
++	    !strncasecmp(s, "SCPS", 4) || !strncasecmp(s, "SCPM", 4) ||
++	    !strncasecmp(s, "SIPS", 4) || !strncasecmp(s, "PAPX", 4))
++		return "NTSC-J";
++	return "";
++}
++
++/* ---- the games list ---- */
++
++int library_count(void) { return ngames; }
++struct game *library_game(int i) { return i >= 0 && i < ngames ? &games[i] : NULL; }
++int library_sort_mode(void) { return sort_mode; }
++int library_folders(void) { return nfolders; }
++const char *library_folder(int i) { return i >= 0 && i < nfolders ? folders[i] : NULL; }
++
++struct game *library_find(const char *path)
++{
++	int i;
++	for (i = 0; i < ngames; i++)
++		if (strcasecmp(games[i].path, path) == 0)
++			return &games[i];
++	return NULL;
++}
++
++static struct game *add_game(const char *path, int source)
++{
++	struct game *g = library_find(path);
++	if (g) {
++		g->source |= source;
++		return g;
++	}
++	if (ngames == LIB_MAX_GAMES)
++		return NULL;
++	g = &games[ngames++];
++	memset(g, 0, sizeof *g);
++	snprintf(g->path, sizeof g->path, "%s", path);
++	display_name(path, g->name, sizeof g->name);
++	g->source = source;
++	return g;
++}
++
++void library_remove(struct game *g)
++{
++	int i = (int)(g - games);
++	if (i < 0 || i >= ngames)
++		return;
++	memmove(&games[i], &games[i + 1], (ngames - i - 1) * sizeof *games);
++	ngames--;
++}
++
++static int cmp_name(const void *a, const void *b)
++{
++	const struct game *x = a, *y = b;
++	int c = strcasecmp(x->name, y->name);
++	return c ? c : strcasecmp(x->path, y->path);
++}
++
++static int cmp_last(const void *a, const void *b)
++{
++	const struct game *x = a, *y = b;
++	if (x->last != y->last)
++		return x->last < y->last ? 1 : -1;
++	return cmp_name(a, b);
++}
++
++void library_sort(int mode)
++{
++	sort_mode = mode;
++	qsort(games, ngames, sizeof *games, mode == SORT_LAST ? cmp_last : cmp_name);
++}
++
++int library_recent(struct game **out, int max)
++{
++	int i, j, n = 0;
++	for (i = 0; i < ngames; i++) {
++		struct game *g = &games[i];
++		if (!g->last)
++			continue;
++		/* insertion into the top MAX by last played */
++		for (j = n; j > 0 && out[j - 1]->last < g->last; j--)
++			if (j < max)
++				out[j] = out[j - 1];
++		if (j < max) {
++			out[j] = g;
++			if (n < max)
++				n++;
++		}
++	}
++	return n;
++}
++
++struct game *library_note_played(const char *path, const char *serial)
++{
++	struct game *g = add_game(path, LIB_PLAYED);
++	if (g == NULL)
++		return NULL;
++	if (serial && serial[0])
++		snprintf(g->serial, sizeof g->serial, "%s", serial);
++	g->last = (unsigned)time(NULL);
++	g->plays++;
++	library_find_cover(g);
++	library_count_states(g);
++	library_sort(sort_mode);
++	return library_find(path);
++}
++
++/* ---- disc images: the serial from SYSTEM.CNF ---- */
++
++/* Reads 2048 bytes of user data of sector LBA. */
++static int read_sector(FILE *f, int sector_size, int data_off, long lba, unsigned char *buf)
++{
++	if (fseek(f, lba * sector_size + data_off, SEEK_SET) != 0)
++		return 0;
++	return fread(buf, 1, 2048, f) == 2048;
++}
++
++static int serial_from_image(const char *img, int sector_size, int data_off,
++                             char *serial, int len)
++{
++	unsigned char pvd[2048], dir[2048];
++	FILE *f = fopen(img, "rb");
++	long root_lba, root_len, off, i;
++	int ok = 0;
++	if (f == NULL)
++		return 0;
++	if (sector_size == 0) {           /* guess from the size */
++		fseek(f, 0, SEEK_END);
++		sector_size = (ftell(f) % 2352 == 0 && ftell(f) % 2048 != 0) ? 2352 : 2048;
++		data_off = sector_size == 2352 ? 24 : 0;
++	}
++	if (!read_sector(f, sector_size, data_off, 16, pvd) || memcmp(pvd + 1, "CD001", 5) != 0) {
++		/* a Mode 1 image read as Mode 2? try the other offset */
++		if (sector_size == 2352 && read_sector(f, 2352, 16, 16, pvd) &&
++		    memcmp(pvd + 1, "CD001", 5) == 0)
++			data_off = 16;
++		else {
++			fclose(f);
++			return 0;
++		}
++	}
++	root_lba = pvd[156 + 2] | pvd[156 + 3] << 8 | pvd[156 + 4] << 16 | (long)pvd[156 + 5] << 24;
++	root_len = pvd[156 + 10] | pvd[156 + 11] << 8 | pvd[156 + 12] << 16 | (long)pvd[156 + 13] << 24;
++	if (root_len > 8 * 2048)
++		root_len = 8 * 2048;
++	for (off = 0; off < root_len && !ok; off += 2048) {
++		if (!read_sector(f, sector_size, data_off, root_lba + off / 2048, dir))
++			break;
++		for (i = 0; i < 2048 && dir[i]; i += dir[i]) {
++			int nl = dir[i + 32];
++			const char *nm = (const char *)dir + i + 33;
++			if (nl >= 10 && strncasecmp(nm, "SYSTEM.CNF", 10) == 0) {
++				unsigned char cnf[2048];
++				long lba = dir[i + 2] | dir[i + 3] << 8 | dir[i + 4] << 16 | (long)dir[i + 5] << 24;
++				char *b, *p, *o;
++				if (!read_sector(f, sector_size, data_off, lba, cnf))
++					break;
++				cnf[2047] = 0;
++				b = strstr((char *)cnf, "BOOT");
++				if (b && (p = strchr(b, '\\')) != NULL) {
++					/* cdrom:\SLES_025.74;1 -> SLES02574 */
++					p++;
++					for (o = serial; *p && *p != ';' && *p > ' ' && o < serial + len - 1; p++)
++						if (isalnum((unsigned char)*p))
++							*o++ = (char)toupper((unsigned char)*p);
++					*o = 0;
++					ok = serial[0] != 0;
++				}
++				break;
++			}
++			if (dir[i] == 0)
++				break;
++		}
++	}
++	fclose(f);
++	return ok;
++}
++
++int library_read_serial(const char *path, char *serial, int len)
++{
++	const char *e = ext(path);
++	serial[0] = 0;
++	if (!strcasecmp(e, ".iso"))
++		return serial_from_image(path, 2048, 0, serial, len);
++	if (!strcasecmp(e, ".img") || !strcasecmp(e, ".bin"))
++		return serial_from_image(path, 0, 0, serial, len);
++	if (!strcasecmp(e, ".cue")) {
++		/* the first FILE and the first TRACK's mode */
++		char line[600], file[512] = "", mode[32] = "";
++		FILE *f = fopen(path, "r");
++		if (f == NULL)
++			return 0;
++		while (fgets(line, sizeof line, f)) {
++			char *q;
++			if (!file[0] && (q = strstr(line, "FILE")) != NULL) {
++				char *a = strchr(q, '"'), *b2 = a ? strchr(a + 1, '"') : NULL;
++				if (a && b2)
++					snprintf(file, sizeof file, "%.*s", (int)(b2 - a - 1), a + 1);
++			} else if (!mode[0] && (q = strstr(line, "TRACK")) != NULL)
++				sscanf(q, "TRACK %*d %31s", mode);
++		}
++		fclose(f);
++		if (file[0]) {
++			char img[1024];
++			const char *sl = strrchr(path, '/');
++			int size = 2352, off = 24, k;
++			if (!strncasecmp(mode, "MODE1/2048", 10)) { size = 2048; off = 0; }
++			else if (!strncasecmp(mode, "MODE1/2352", 10)) off = 16;
++			snprintf(img, sizeof img, "%.*s%s", sl ? (int)(sl - path + 1) : 0, path, file);
++			if (serial_from_image(img, size, off, serial, len))
++				return 1;
++#ifdef __riscos__
++			/* names with spaces are kept with hard spaces */
++			for (k = 0; img[k]; k++)
++				if (img[k] == ' ')
++					img[k] = (char)0xA0;
++			return serial_from_image(img, size, off, serial, len);
++#else
++			(void)k;
++#endif
++		}
++	}
++	return 0;
++}
++
++/* ---- covers, states ---- */
++
++static int exists(const char *p)
++{
++	struct stat st;
++	return stat(p, &st) == 0;
++}
++
++void library_find_cover(struct game *g)
++{
++	char base[512], dir[512], p[1100], safe[160];
++	const char *l = leaf(g->path);
++	const char *d = strrchr(l, '.');
++	snprintf(base, sizeof base, "%.*s", d ? (int)(d - l) : (int)strlen(l), l);
++	snprintf(dir, sizeof dir, "%.*s", (int)(l - g->path), g->path);
++	rofe_safe_name(g->path, safe, sizeof safe);
++	g->cover[0] = 0;
++	/* next to the disc; a covers folder beside it; ours, by serial or name */
++	snprintf(p, sizeof p, "%s%s.jpg", dir, base);
++	if (!exists(p)) snprintf(p, sizeof p, "%scovers/%s.jpg", dir, base);
++	if (!exists(p) && g->serial[0]) snprintf(p, sizeof p, "%s/%s.jpg", covers_dir, g->serial);
++	if (!exists(p)) snprintf(p, sizeof p, "%s/%s.jpg", covers_dir, safe);
++	if (exists(p))
++		snprintf(g->cover, sizeof g->cover, "%s", p);
++}
++
++void library_count_states(struct game *g)
++{
++	char safe[160], dir[700];
++	DIR *dp;
++	struct dirent *e;
++	rofe_safe_name(g->path, safe, sizeof safe);
++	snprintf(dir, sizeof dir, "%s/%s", states_dir, safe);
++	g->states = 0;
++	if ((dp = opendir(dir)) == NULL)
++		return;
++	while ((e = readdir(dp)) != NULL)
++		if (e->d_name[0] != '.')
++			g->states++;
++	closedir(dp);
++}
++
++/* ---- scanning ---- */
++
++static int is_game_ext(const char *e)
++{
++	static const char *const exts[] = { ".cue", ".chd", ".pbp", ".iso", ".img",
++	                                    ".bin", ".m3u", ".exe", NULL };
++	int i;
++	for (i = 0; exts[i]; i++)
++		if (!strcasecmp(e, exts[i]))
++			return 1;
++	return 0;
++}
++
++static int found;
++
++static void scan_dir(const char *dir, int depth)
++{
++	DIR *dp;
++	struct dirent *e;
++	char (*names)[256] = NULL;
++	int n = 0, cap = 0, i, has_cue = 0;
++	char m3u_listed[64][256];
++	int nm3u = 0;
++
++	if (depth > 4 || (dp = opendir(dir)) == NULL)
++		return;
++	while ((e = readdir(dp)) != NULL) {
++		if (e->d_name[0] == '.' && (!e->d_name[1] || e->d_name[1] == '.'))
++			continue;
++		if (n == cap) {
++			void *nn = realloc(names, (cap = cap ? cap * 2 : 64) * sizeof *names);
++			if (nn == NULL)
++				break;
++			names = nn;
++		}
++		snprintf(names[n++], 256, "%s", e->d_name);
++	}
++	closedir(dp);
++	for (i = 0; i < n; i++)
++		if (!strcasecmp(ext(names[i]), ".cue"))
++			has_cue = 1;
++	/* discs named in .m3u files belong to them */
++	for (i = 0; i < n; i++)
++		if (!strcasecmp(ext(names[i]), ".m3u")) {
++			char p[800], line[300];
++			FILE *f;
++			snprintf(p, sizeof p, "%s/%s", dir, names[i]);
++			if ((f = fopen(p, "r")) != NULL) {
++				while (fgets(line, sizeof line, f) && nm3u < 64) {
++					char *s = line + strspn(line, " \t");
++					s[strcspn(s, "\r\n")] = 0;
++					if (*s && *s != '#')
++						snprintf(m3u_listed[nm3u++], 256, "%s", leaf(s));
++				}
++				fclose(f);
++			}
++		}
++	for (i = 0; i < n; i++) {
++		char p[800];
++		struct stat st;
++		const char *e2 = ext(names[i]);
++		int k, listed = 0;
++		snprintf(p, sizeof p, "%s/%s", dir, names[i]);
++		if (stat(p, &st) != 0)
++			continue;
++		if (S_ISDIR(st.st_mode)) {
++			scan_dir(p, depth + 1);
++			continue;
++		}
++		if (!is_game_ext(e2))
++			continue;
++		if (has_cue && (!strcasecmp(e2, ".bin") || !strcasecmp(e2, ".img")))
++			continue;
++		if (!strcasecmp(e2, ".bin"))       /* a .bin with no .cue: not playable alone */
++			continue;
++		for (k = 0; k < nm3u; k++)
++			if (!strcasecmp(m3u_listed[k], names[i]))
++				listed = 1;
++		if (listed)
++			continue;
++		{
++			struct game *g = add_game(p, LIB_SCANNED);
++			if (g) {
++				if (!g->serial[0])
++					library_read_serial(p, g->serial, sizeof g->serial);
++				library_find_cover(g);
++				library_count_states(g);
++				found++;
++			}
++		}
++	}
++	free(names);
++}
++
++int library_scan(void)
++{
++	int i;
++	/* scanned games no longer there go (played ones stay) */
++	for (i = ngames - 1; i >= 0; i--) {
++		struct stat st;
++		if ((games[i].source & LIB_SCANNED) && stat(games[i].path, &st) != 0) {
++			if (games[i].source & LIB_PLAYED)
++				games[i].source = LIB_PLAYED;
++			else
++				library_remove(&games[i]);
++		}
++	}
++	found = 0;
++	for (i = 0; i < nfolders; i++)
++		scan_dir(folders[i], 0);
++	library_sort(sort_mode);
++	plat_log("Library: %d games found in %d folders, %d in all\n", found, nfolders, ngames);
++	return found;
++}
++
++int library_add_folder(const char *path)
++{
++	int i;
++	char p[512];
++	snprintf(p, sizeof p, "%s", path);
++	while (strlen(p) > 1 && p[strlen(p) - 1] == '/')
++		p[strlen(p) - 1] = 0;
++	for (i = 0; i < nfolders; i++)
++		if (!strcasecmp(folders[i], p))
++			return 0;
++	if (nfolders == LIB_MAX_FOLDERS)
++		return 0;
++	snprintf(folders[nfolders++], 512, "%s", p);
++	found = 0;
++	scan_dir(p, 0);
++	library_sort(sort_mode);
++	plat_log("Library: folder %s added, %d games\n", p, found);
++	return 1;
++}
++
++void library_remove_folder(int i)
++{
++	int k;
++	if (i < 0 || i >= nfolders)
++		return;
++	/* its games go, unless they've been played */
++	for (k = ngames - 1; k >= 0; k--)
++		if (!strncasecmp(games[k].path, folders[i], strlen(folders[i])) &&
++		    games[k].path[strlen(folders[i])] == '/') {
++			if (games[k].source & LIB_PLAYED)
++				games[k].source = LIB_PLAYED;
++			else
++				library_remove(&games[k]);
++		}
++	memmove(folders[i], folders[i + 1], (nfolders - i - 1) * sizeof folders[0]);
++	nfolders--;
++}
++
++/* ---- the library file ---- */
++
++int library_load(void)
++{
++	char line[1400];
++	FILE *f = fopen(lib_file, "r");
++	if (f == NULL)
++		return 0;
++	ngames = nfolders = 0;
++	while (fgets(line, sizeof line, f)) {
++		line[strcspn(line, "\r\n")] = 0;
++		if (!strncmp(line, "folder: ", 8) && nfolders < LIB_MAX_FOLDERS)
++			snprintf(folders[nfolders++], 512, "%s", line + 8);
++		else if (!strncmp(line, "game: ", 6) && ngames < LIB_MAX_GAMES) {
++			char *fld[6], *s = line + 6;
++			int k;
++			for (k = 0; k < 6; k++) {
++				fld[k] = s;
++				s = strchr(s, '\t');
++				if (s)
++					*s++ = 0;
++				else {
++					for (k++; k < 6; k++)
++						fld[k] = "";
++					break;
++				}
++			}
++			{
++				struct game *g = add_game(fld[0], atoi(fld[5]) ? atoi(fld[5]) : LIB_PLAYED);
++				if (g) {
++					if (fld[1][0])
++						snprintf(g->name, sizeof g->name, "%s", fld[1]);
++					snprintf(g->serial, sizeof g->serial, "%s", fld[2]);
++					g->last = (unsigned)strtoul(fld[3], NULL, 10);
++					g->plays = (unsigned)strtoul(fld[4], NULL, 10);
++					library_find_cover(g);
++					library_count_states(g);
++				}
++			}
++		}
++	}
++	fclose(f);
++	library_sort(sort_mode);
++	return 1;
++}
++
++int library_save(void)
++{
++	int i;
++	FILE *f = fopen(lib_file, "w");
++	if (f == NULL)
++		return 0;
++	fprintf(f, "# !PCSX games library (written by PCSX; edit with care)\n");
++	for (i = 0; i < nfolders; i++)
++		fprintf(f, "folder: %s\n", folders[i]);
++	for (i = 0; i < ngames; i++)
++		fprintf(f, "game: %s\t%s\t%s\t%u\t%u\t%d\n", games[i].path, games[i].name,
++		        games[i].serial, games[i].last, games[i].plays, games[i].source);
++	return fclose(f) == 0;
++}
++
++/* ---- per-game settings ---- */
++
++void library_settings_path(const struct game *g, char *buf, int len)
++{
++	char key[160];
++	library_key(g, key, sizeof key);
++	snprintf(buf, len, "%s/%s", settings_dir, key);
++}
++
++const char *library_setting(const struct game *g, const char *key, char *buf, int len)
++{
++	char path[700], line[300];
++	FILE *f;
++	const char *r = NULL;
++	library_settings_path(g, path, sizeof path);
++	if ((f = fopen(path, "r")) == NULL)
++		return NULL;
++	while (fgets(line, sizeof line, f)) {
++		char *sep = strchr(line, ':');
++		size_t kl = strlen(key);
++		if (sep && (size_t)(sep - line) == kl && !strncasecmp(line, key, kl)) {
++			char *v = sep + 1;
++			v += strspn(v, " \t");
++			v[strcspn(v, "\r\n")] = 0;
++			snprintf(buf, len, "%s", v);
++			r = buf;
++		}
++	}
++	fclose(f);
++	return r;
++}
++
++int library_set_setting(const struct game *g, const char *key, const char *value)
++{
++	char path[700], line[300];
++	char (*lines)[300] = NULL;
++	int n = 0, i, done = 0;
++	FILE *f;
++	library_settings_path(g, path, sizeof path);
++	mkdir(settings_dir, 0777);
++	if ((f = fopen(path, "r")) != NULL) {
++		while (fgets(line, sizeof line, f)) {
++			void *nl = realloc(lines, (n + 1) * sizeof *lines);
++			if (nl == NULL)
++				break;
++			lines = nl;
++			line[strcspn(line, "\r\n")] = 0;
++			snprintf(lines[n++], 300, "%s", line);
++		}
++		fclose(f);
++	}
++	if ((f = fopen(path, "w")) == NULL) {
++		free(lines);
++		return 0;
++	}
++	if (n == 0)
++		fprintf(f, "# !PCSX settings for %s (%s)\n", g->name, g->serial);
++	for (i = 0; i < n; i++) {
++		char *sep = strchr(lines[i], ':');
++		size_t kl = strlen(key);
++		if (sep && (size_t)(sep - lines[i]) == kl && !strncasecmp(lines[i], key, kl)) {
++			if (value && !done)
++				fprintf(f, "%s: %s\n", key, value);
++			done = 1;
++		} else
++			fprintf(f, "%s\n", lines[i]);
++	}
++	if (!done && value)
++		fprintf(f, "%s: %s\n", key, value);
++	free(lines);
++	return fclose(f) == 0;
++}
+diff --git a/frontend/riscos/library.h b/frontend/riscos/library.h
+new file mode 100644
+index 00000000..1999feae
+--- /dev/null
++++ b/frontend/riscos/library.h
+@@ -0,0 +1,67 @@
++/*
++ * !PCSX's games library: the games found in the folders the user added,
++ * plus every game played, with what's known about each (title, serial,
++ * region, last played, cover, per-game settings). Portable C (opendir,
++ * stdio): the Wimp window that shows it is libwin.c.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#ifndef LIBRARY_H
++#define LIBRARY_H
++
++#define LIB_MAX_GAMES 2000
++#define LIB_MAX_FOLDERS 16
++
++enum { LIB_SCANNED = 1, LIB_PLAYED = 2 };      /* where an entry came from */
++enum { SORT_NAME, SORT_LAST };
++
++struct game {
++	char path[512];        /* Unix form, as UnixLib takes it */
++	char name[128];        /* shown: the file name without its extension */
++	char serial[16];       /* e.g. SLES02574, or "" if not known yet */
++	unsigned last;         /* last played, time_t, 0 = never */
++	unsigned plays;
++	int source;            /* LIB_SCANNED | LIB_PLAYED */
++	int states;            /* save states found (counted by library_states) */
++	char cover[512];       /* the JPEG found for it, or "" */
++};
++
++/* Where things live (Unix form): the library file, the covers folder, the
++   per-game settings folder, the save states folder. */
++void library_init(const char *file, const char *covers_dir,
++                  const char *settings_dir, const char *states_dir);
++int library_load(void);
++int library_save(void);
++
++int library_folders(void);
++const char *library_folder(int i);
++int library_add_folder(const char *path);     /* 1 if added (and scanned) */
++void library_remove_folder(int i);
++int library_scan(void);                       /* rescan every folder; games found */
++
++int library_count(void);
++struct game *library_game(int i);             /* in the current sort order */
++struct game *library_find(const char *path);
++struct game *library_note_played(const char *path, const char *serial);
++void library_remove(struct game *g);
++void library_sort(int mode);
++int library_sort_mode(void);
++/* the n most recently played (n <= max), for the top of the window */
++int library_recent(struct game **out, int max);
++
++/* What a game's serial says: "PAL", "NTSC-U", "NTSC-J" or "". */
++const char *library_region(const char *serial);
++/* The serial from a disc image's SYSTEM.CNF (cue/bin, iso, img), or 0. */
++int library_read_serial(const char *path, char *serial, int len);
++/* Looks for a cover JPEG; sets g->cover. */
++void library_find_cover(struct game *g);
++void library_count_states(struct game *g);
++
++/* Per-game settings: a Choices file named after the serial (or name). */
++void library_settings_path(const struct game *g, char *buf, int len);
++const char *library_setting(const struct game *g, const char *key, char *buf, int len);
++int library_set_setting(const struct game *g, const char *key, const char *value);
++/* The key used for files named after a game (serial, else a safe name). */
++void library_key(const struct game *g, char *buf, int len);
++
++#endif
+diff --git a/frontend/riscos/libwin.c b/frontend/riscos/libwin.c
+new file mode 100644
+index 00000000..33e7955c
+--- /dev/null
++++ b/frontend/riscos/libwin.c
+@@ -0,0 +1,715 @@
++/*
++ * The games library window: "Recently played" at the top, then every game,
++ * one row each with its cover (a JPEG, drawn by SpriteExtend), title,
++ * region, serial, when it was last played and its save states. Drag
++ * folders in to add them; double-click (or Return) to play; the menu has
++ * per-game settings, sorting, rescanning and the folders.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <sys/stat.h>
++#include <kernel.h>
++#include <swis.h>
++#include <unixlib/local.h>
++#include "rofe.h"
++#include "library.h"
++#include "ui.h"
++
++#ifndef JPEG_Info
++#define JPEG_Info        0x49980
++#define JPEG_PlotScaled  0x49982
++#endif
++#ifndef Hourglass_Off
++#define Hourglass_Off    0x406C1
++#endif
++
++
++#define ROW_H     152          /* OS units */
++#define HEAD_H    64
++#define COVER     128
++#define MARGIN    12
++#define TEXT_X    (MARGIN * 2 + COVER + 16)
++#define WIN_W     1600
++#define MAX_RECENT 5
++
++static int win = -1;
++static char title[64] = "PCSX games";
++
++/* the rows shown: section headings and games */
++struct row { int head; struct game *g; char text[64]; };
++static struct row *rows;
++static int nrows, rows_cap;
++static int sel = -1;               /* selected row */
++static int show_covers = 1;
++
++static void build_rows(void)
++{
++	struct game *rec[MAX_RECENT];
++	int nrec, i, need = library_count() + MAX_RECENT + 3;
++	if (need > rows_cap) {
++		struct row *r = realloc(rows, need * sizeof *rows);
++		if (r == NULL)
++			return;
++		rows = r;
++		rows_cap = need;
++	}
++	nrows = 0;
++	nrec = library_recent(rec, MAX_RECENT);
++	if (nrec) {
++		rows[nrows].head = 1;
++		rows[nrows].g = NULL;
++		snprintf(rows[nrows++].text, 64, "Recently played");
++		for (i = 0; i < nrec; i++) {
++			rows[nrows].head = 0;
++			rows[nrows++].g = rec[i];
++		}
++	}
++	rows[nrows].head = 1;
++	rows[nrows].g = NULL;
++	snprintf(rows[nrows++].text, 64, "All games (%d)%s", library_count(),
++	         library_sort_mode() == SORT_LAST ? ", last played first" : "");
++	for (i = 0; i < library_count(); i++) {
++		rows[nrows].head = 0;
++		rows[nrows++].g = library_game(i);
++	}
++	if (sel >= nrows)
++		sel = -1;
++}
++
++static int row_h(int i) { return rows[i].head ? HEAD_H : ROW_H; }
++
++/* work area y of row i's top (0 at the top, going down) */
++static int row_top(int i)
++{
++	int k, y = 0;
++	for (k = 0; k < i; k++)
++		y -= row_h(k);
++	return y;
++}
++
++static int extent_h(void)
++{
++	int h = nrows ? -row_top(nrows) : 0;
++	return h < 600 ? 600 : h + ROW_H;
++}
++
++/* ---- covers: JPEG files, kept in memory once read ---- */
++
++#define MAX_COVERS 48
++static struct cover { char path[512]; void *data; int len, w, h; unsigned used; } covers[MAX_COVERS];
++static unsigned cover_clock;
++
++static struct cover *cover_get(const char *path)
++{
++	int i, victim = 0;
++	FILE *f;
++	long n;
++	struct cover *c;
++	_kernel_swi_regs r;
++	for (i = 0; i < MAX_COVERS; i++)
++		if (covers[i].data && !strcmp(covers[i].path, path)) {
++			covers[i].used = ++cover_clock;
++			return covers[i].w > 0 ? &covers[i] : NULL;
++		}
++	for (i = 1; i < MAX_COVERS; i++)
++		if (covers[i].used < covers[victim].used)
++			victim = i;
++	c = &covers[victim];
++	free(c->data);
++	memset(c, 0, sizeof *c);
++	snprintf(c->path, sizeof c->path, "%s", path);
++	c->used = ++cover_clock;
++	if ((f = fopen(path, "rb")) == NULL)
++		return NULL;
++	fseek(f, 0, SEEK_END);
++	n = ftell(f);
++	fseek(f, 0, SEEK_SET);
++	if (n <= 0 || n > 4 << 20 || (c->data = malloc(n)) == NULL ||
++	    fread(c->data, 1, n, f) != (size_t)n) {
++		fclose(f);
++		if (!c->data)
++			c->data = malloc(1);   /* remember the failure */
++		c->w = 0;
++		return NULL;
++	}
++	fclose(f);
++	c->len = (int)n;
++	r.r[0] = 1;                    /* dimensions */
++	r.r[1] = (int)c->data;
++	r.r[2] = c->len;
++	if (_kernel_swi(JPEG_Info | 0x20000, &r, &r) == NULL && r.r[2] > 0 && r.r[3] > 0) {
++		c->w = r.r[2];
++		c->h = r.r[3];
++		return c;
++	}
++	plat_log("Library: %s isn't a JPEG SpriteExtend can draw\n", path);
++	c->w = 0;
++	return NULL;
++}
++
++static void fill(unsigned bbggrr00, int x0, int y0, int x1, int y1)
++{
++	_swix(ColourTrans_SetGCOL, _IN(0) | _INR(3, 4), bbggrr00, 0, 0);
++	_swix(OS_Plot, _INR(0, 2), 4, x0, y0);
++	_swix(OS_Plot, _INR(0, 2), 101, x1 - 1, y1 - 1);
++}
++
++static void text(const char *s, int x, int y, unsigned fg, unsigned bg)
++{
++	_swix(Wimp_TextOp, _INR(0, 2), 0, fg, bg);
++	_swix(Wimp_TextOp, _INR(0, 5), 2, s, -1, -1, x, y);
++}
++
++static void draw_cover(struct game *g, int x0, int y0)
++{
++	struct cover *c = g->cover[0] ? cover_get(g->cover) : NULL;
++	int bw = COVER >> ui_eig_x(), bh = COVER >> ui_eig_y();   /* box, pixels */
++	if (c == NULL) {
++		fill(0xDDDDDD00, x0, y0, x0 + COVER, y0 + COVER);
++		text("?", x0 + COVER / 2 - 8, y0 + COVER / 2 - 8, 0x99999900, 0xDDDDDD00);
++		return;
++	}
++	{
++		/* 1:1 is a JPEG pixel to a screen pixel: fit the box, keep the shape */
++		int sb[4], pw, ph;
++		if ((long long)c->w * bh > (long long)c->h * bw) {
++			sb[0] = sb[1] = bw;
++			sb[2] = sb[3] = c->w;
++		} else {
++			sb[0] = sb[1] = bh;
++			sb[2] = sb[3] = c->h;
++		}
++		pw = (int)((long long)c->w * sb[0] / sb[2]) << ui_eig_x();
++		ph = (int)((long long)c->h * sb[1] / sb[3]) << ui_eig_y();
++		_swix(JPEG_PlotScaled, _INR(0, 5), c->data, x0 + (COVER - pw) / 2,
++		      y0 + (COVER - ph) / 2, sb, c->len, 1 /* dither */);
++	}
++}
++
++static void when(unsigned t, char *buf, int len)
++{
++	time_t tt = (time_t)t, now = time(NULL);
++	struct tm a, b;
++	if (!t) {
++		snprintf(buf, len, "never played");
++		return;
++	}
++	a = *localtime(&tt);
++	b = *localtime(&now);
++	if (a.tm_year == b.tm_year && a.tm_yday == b.tm_yday)
++		strftime(buf, len, "played today at %H:%M", &a);
++	else
++		strftime(buf, len, "played %d %b %Y", &a);
++}
++
++static void draw_row(int i, int ox, int oy, int width)
++{
++	struct row *r = &rows[i];
++	int top = oy + row_top(i), bot = top - row_h(i);
++	unsigned bg = i == sel ? 0xFFDDBB00 : 0xFFFFFF00;
++	if (r->head) {
++		fill(0xEEEEEE00, ox, bot, ox + width, top);
++		text(r->text, ox + MARGIN * 2, bot + 20, 0x55555500, 0xEEEEEE00);
++		return;
++	}
++	if (i == sel)
++		fill(bg, ox, bot, ox + width, top);
++	if (show_covers)
++		draw_cover(r->g, ox + MARGIN * 2, bot + MARGIN);
++	{
++		int tx = ox + (show_covers ? TEXT_X : MARGIN * 2);
++		char line[200], w[48];
++		const char *reg = library_region(r->g->serial);
++		text(r->g->name, tx, top - 52, 0x00000000, bg);
++		when(r->g->last, w, sizeof w);
++		snprintf(line, sizeof line, "%s%s%s%s%s", reg, reg[0] ? "  " : "",
++		         r->g->serial[0] ? r->g->serial : "", r->g->serial[0] ? "  " : "", w);
++		text(line, tx, top - 96, 0x55555500, bg);
++		if (r->g->states)
++			snprintf(line, sizeof line, "%d save state%s", r->g->states,
++			         r->g->states == 1 ? "" : "s");
++		else
++			line[0] = 0;
++		{
++			char sp[700], v[8];
++			FILE *f;
++			library_settings_path(r->g, sp, sizeof sp);
++			if ((f = fopen(sp, "r")) != NULL) {
++				fclose(f);
++				snprintf(line + strlen(line), sizeof line - strlen(line), "%sown settings",
++				         line[0] ? "  " : "");
++			}
++			(void)v;
++		}
++		if (line[0])
++			text(line, tx, top - 136, 0x88444400, bg);
++	}
++	fill(0xEEEEEE00, ox, bot, ox + width, bot + 2);
++}
++
++void libwin_redraw(int *b)
++{
++	int more = 0;
++	_swix(Wimp_RedrawWindow, _IN(1) | _OUT(0), b, &more);
++	while (more) {
++		int ox = b[1] - b[5], oy = b[4] - b[6], i;
++		/* graphics window b[7..10] in screen coordinates: the rows in it */
++		int gy0 = b[8] - oy, gy1 = b[10] - oy;    /* work area */
++		if (nrows == 0 || library_count() == 0) {
++			text("Drag folders of PlayStation disc images here to add them.",
++			     ox + 32, oy - 80, 0x00000000, 0xFFFFFF00);
++			text("Drag a disc image (.cue, .chd, .pbp, .iso, .m3u, .exe) here to play it.",
++			     ox + 32, oy - 130, 0x00000000, 0xFFFFFF00);
++			text("Covers: a JPEG with the disc's name next to it, or in",
++			     ox + 32, oy - 200, 0x55555500, 0xFFFFFF00);
++			text("<Choices$Write>.PCSX.covers named after the serial (e.g. SLES02574/jpg).",
++			     ox + 32, oy - 240, 0x55555500, 0xFFFFFF00);
++		}
++		for (i = 0; i < nrows; i++) {
++			int top = row_top(i), bot = top - row_h(i);
++			if (bot > gy1 || top < gy0)
++				continue;
++			draw_row(i, ox, oy, WIN_W);
++		}
++		_swix(Wimp_GetRectangle, _IN(1) | _OUT(0), b, &more);
++	}
++}
++
++static void redraw_row(int i)
++{
++	if (i < 0 || i >= nrows)
++		return;
++	_swix(Wimp_ForceRedraw, _INR(0, 4), win, 0, row_top(i) - row_h(i), WIN_W, row_top(i));
++}
++
++static void refresh(void)
++{
++	int e[4] = { 0, 0, WIN_W, 0 };
++	build_rows();
++	e[1] = -extent_h();
++	_swix(Wimp_SetExtent, _INR(0, 1), win, e);
++	_swix(Wimp_ForceRedraw, _INR(0, 4), win, 0, -0x100000, WIN_W, 0);
++	snprintf(title, sizeof title, "PCSX games (%d)", library_count());
++	_swix(Wimp_ForceRedraw, _INR(0, 2), win, TASK_WORD, 3);
++}
++
++/* ---- window ---- */
++
++void libwin_init(void)
++{
++	int b[23];
++	library_init("/<Choices$Write>/PCSX/Library", "/<Choices$Write>/PCSX/covers",
++	             "/<Choices$Write>/PCSX/games", "/<Choices$Write>/PCSX/states");
++	library_load();
++	{
++		const char *c = choices_get("library.covers");
++		show_covers = c ? choices_get_int("library.covers", 1) : 1;
++		if (choices_get_int("library.sort", 0) == 1)
++			library_sort(SORT_LAST);
++	}
++	memset(b, 0, sizeof b);
++	b[0] = 200; b[1] = 200; b[2] = 200 + 1300; b[3] = 200 + 1100;
++	b[6] = -1;
++	/* back, close, title, toggle, vertical scroll, adjust size; movable */
++	b[7] = (int)0xBF000002;
++	((unsigned char *)b)[32] = 7;  ((unsigned char *)b)[33] = 2;
++	((unsigned char *)b)[34] = 7;  ((unsigned char *)b)[35] = 0;   /* white */
++	((unsigned char *)b)[36] = 3;  ((unsigned char *)b)[37] = 1;
++	((unsigned char *)b)[38] = 12;
++	b[10] = 0; b[11] = -2000; b[12] = WIN_W; b[13] = 0;
++	b[14] = 0x13D;
++	b[15] = 10 << 12;              /* double click / drag */
++	b[16] = 1;
++	b[17] = (400 << 16) | 600;     /* minimum size */
++	b[18] = (int)title;
++	b[19] = -1;
++	b[20] = sizeof title;
++	b[21] = 0;
++	if (_swix(Wimp_CreateWindow, _IN(1) | _OUT(0), b, &win))
++		win = -1;
++	build_rows();
++}
++
++int libwin_window(void) { return win; }
++
++void libwin_open(void)
++{
++	int b[9];
++	refresh();
++	b[0] = win;
++	_swix(Wimp_GetWindowState, _IN(1), b);
++	if (b[3] - b[1] < 100) {           /* never opened: middle of the screen */
++		int w = 1300, h = 1100;
++		int sw = ui_screen_w() << ui_eig_x(), sh = ui_screen_h() << ui_eig_y();
++		if (h > sh - 200) h = sh - 200;
++		b[1] = (sw - w) / 2;
++		b[3] = b[1] + w;
++		b[2] = (sh - h) / 2;
++		b[4] = b[2] + h;
++		b[5] = 0;
++		b[6] = 0;
++	}
++	b[7] = -1;
++	_swix(Wimp_OpenWindow, _IN(1), b);
++	_swix(Wimp_SetCaretPosition, _INR(0, 5), win, -1, 0, 0, 1 << 25, -1);
++}
++
++void libwin_open_request(int *b)
++{
++	_swix(Wimp_OpenWindow, _IN(1), b);
++}
++
++void libwin_mode_changed(void)
++{
++	refresh();
++}
++
++/* keep row i in view */
++static void scroll_to(int i)
++{
++	int b[9], top = row_top(i), bot = top - row_h(i), vh;
++	b[0] = win;
++	if (_swix(Wimp_GetWindowState, _IN(1), b))
++		return;
++	vh = b[4] - b[2];
++	if (top > b[6])
++		b[6] = top;
++	else if (bot < b[6] - vh)
++		b[6] = bot + vh;
++	_swix(Wimp_OpenWindow, _IN(1), b);
++}
++
++static void select_row(int i)
++{
++	int old = sel;
++	if (i >= 0 && (i >= nrows || rows[i].head))
++		i = -1;
++	sel = i;
++	redraw_row(old);
++	redraw_row(sel);
++}
++
++static int row_at(int screen_y)
++{
++	int b[9], wy, i;
++	b[0] = win;
++	if (_swix(Wimp_GetWindowState, _IN(1), b))
++		return -1;
++	wy = screen_y - (b[4] - b[6]);
++	for (i = 0; i < nrows; i++)
++		if (wy <= row_top(i) && wy > row_top(i) - row_h(i))
++			return i;
++	return -1;
++}
++
++static void play_selected(void)
++{
++	if (sel >= 0 && sel < nrows && rows[sel].g) {
++		char path[512];
++		snprintf(path, sizeof path, "%s", rows[sel].g->path);
++		ui_play(path);
++	}
++}
++
++/* ---- menus ---- */
++
++static struct menu m_lib, m_set, m_pad, m_sort, m_fold;
++static char lt[64][40];
++static int nlt;
++static int menu_game_row = -1;      /* the game the menu is about */
++
++static void m_init(struct menu *m, const char *t)
++{
++	memset(m, 0, sizeof *m);
++	strncpy(m->title, t, sizeof m->title);
++	m->colours[0] = 7; m->colours[1] = 2; m->colours[2] = 7; m->colours[3] = 0;
++	m->width = 16 * 12;
++	m->height = 44;
++}
++
++static void m_add(struct menu *m, int i, const char *text, int flags, void *sub)
++{
++	char *t = lt[nlt < 63 ? nlt++ : 63];
++	int w;
++	snprintf(t, 40, "%s", text);
++	m->item[i].flags = flags | ITEM_LAST;
++	m->item[i].submenu = sub ? (int)sub : -1;
++	m->item[i].icon_flags = 0x07000121;
++	m->item[i].data[0] = (int)t;
++	m->item[i].data[1] = -1;
++	m->item[i].data[2] = 40;
++	if (i > 0)
++		m->item[i - 1].flags &= ~ITEM_LAST;
++	w = (int)strlen(t) * 16 + 16;
++	if (w > m->width)
++		m->width = w;
++}
++
++static struct game *menu_game(void)
++{
++	return menu_game_row >= 0 && menu_game_row < nrows ? rows[menu_game_row].g : NULL;
++}
++
++/* the value in effect for a game: its own, else Choices', else DEF */
++static int game_flag(struct game *g, const char *key, const char *on, int def)
++{
++	char v[40];
++	const char *s = g ? library_setting(g, key, v, sizeof v) : NULL;
++	if (s == NULL)
++		s = choices_get(key);
++	if (s == NULL)
++		return def;
++	return strcasecmp(s, on) == 0;
++}
++
++static void build(void)
++{
++	struct game *g = menu_game();
++	int i, shade = g ? 0 : ICON_SHADED;
++	char t[48];
++	nlt = 0;
++
++	m_init(&m_pad, "Pad 1");
++	{
++		static const char *const types[3] = { "standard", "analog", "dualshock" };
++		static const char *const names[3] = { "Standard", "Analogue", "DualShock" };
++		char v[40];
++		const char *cur = g ? library_setting(g, "pad1.type", v, sizeof v) : NULL;
++		if (cur == NULL)
++			cur = choices_get("pad1.type");
++		if (cur == NULL)
++			cur = "standard";
++		for (i = 0; i < 3; i++)
++			m_add(&m_pad, i, names[i], strcasecmp(cur, types[i]) ? 0 : ITEM_TICK, NULL);
++	}
++	m_init(&m_set, "Settings");
++	m_add(&m_set, 0, "High resolution",
++	      game_flag(g, "pcsx_rearmed_neon_enhancement_enable", "enabled", 0) ? ITEM_TICK : 0, NULL);
++	m_add(&m_set, 1, "Dynamic recompiler",
++	      game_flag(g, "pcsx_rearmed_drc", "enabled", 1) ? ITEM_TICK : 0, NULL);
++	m_add(&m_set, 2, "Built-in BIOS only",
++	      game_flag(g, "pcsx_rearmed_bios", "HLE", 0) ? ITEM_TICK : 0, NULL);
++	m_add(&m_set, 3, "Full screen",
++	      game_flag(g, "fullscreen", "1", 0) ? ITEM_TICK : 0, NULL);
++	m_add(&m_set, 4, "Pad 1", ITEM_DOTTED, &m_pad);
++	m_add(&m_set, 5, "Use the usual settings", 0, NULL);
++
++	m_init(&m_sort, "Sort");
++	m_add(&m_sort, 0, "By name", library_sort_mode() == SORT_NAME ? ITEM_TICK : 0, NULL);
++	m_add(&m_sort, 1, "Last played first", library_sort_mode() == SORT_LAST ? ITEM_TICK : 0, NULL);
++
++	m_init(&m_fold, "Folders");
++	if (library_folders() == 0) {
++		m_add(&m_fold, 0, "(drag folders in to add)", 0, NULL);
++		m_fold.item[0].icon_flags |= ICON_SHADED;
++	}
++	for (i = 0; i < library_folders() && i < 16; i++) {
++		const char *f = library_folder(i);
++		size_t l = strlen(f);
++		snprintf(t, sizeof t, "Remove ...%s", l > 26 ? f + l - 26 : f);
++		m_add(&m_fold, i, t, 0, NULL);
++	}
++
++	m_init(&m_lib, "Games");
++	m_add(&m_lib, 0, "Play", 0, NULL);
++	m_add(&m_lib, 1, "Game settings", 0, &m_set);
++	m_add(&m_lib, 2, "Remove from library", ITEM_DOTTED, NULL);
++	m_add(&m_lib, 3, "Sort", 0, &m_sort);
++	m_add(&m_lib, 4, "Rescan folders", 0, NULL);
++	m_add(&m_lib, 5, "Folders", 0, &m_fold);
++	m_add(&m_lib, 6, "Show covers", show_covers ? ITEM_TICK : 0, NULL);
++	for (i = 0; i < 3; i++)
++		m_lib.item[i].icon_flags |= shade;
++	if (g) {
++		snprintf(t, sizeof t, "%.11s", g->name);
++		strncpy(m_lib.title, t, sizeof m_lib.title);
++	}
++}
++
++void libwin_menu_rebuild(void) { build(); }
++void *libwin_menu(void) { return &m_lib; }
++
++static void set_game(struct game *g, const char *key, const char *value)
++{
++	library_set_setting(g, key, value);
++	plat_log("Library: %s: %s = %s\n", g->name, key, value ? value : "(usual)");
++}
++
++void libwin_menu_select(const int *s)
++{
++	struct game *g = menu_game();
++	switch (s[0]) {
++	case 0:
++		if (g) {
++			sel = menu_game_row;
++			play_selected();
++		}
++		break;
++	case 1:
++		if (!g)
++			break;
++		switch (s[1]) {
++		case 0:
++			set_game(g, "pcsx_rearmed_neon_enhancement_enable",
++			         game_flag(g, "pcsx_rearmed_neon_enhancement_enable", "enabled", 0) ? "disabled" : "enabled");
++			break;
++		case 1:
++			set_game(g, "pcsx_rearmed_drc",
++			         game_flag(g, "pcsx_rearmed_drc", "enabled", 1) ? "disabled" : "enabled");
++			break;
++		case 2:
++			set_game(g, "pcsx_rearmed_bios",
++			         game_flag(g, "pcsx_rearmed_bios", "HLE", 0) ? "auto" : "HLE");
++			break;
++		case 3:
++			set_game(g, "fullscreen", game_flag(g, "fullscreen", "1", 0) ? "0" : "1");
++			break;
++		case 4:
++			if (s[2] >= 0 && s[2] < 3) {
++				static const char *const types[3] = { "standard", "analog", "dualshock" };
++				set_game(g, "pad1.type", types[s[2]]);
++			}
++			break;
++		case 5: {
++			char p[700];
++			library_settings_path(g, p, sizeof p);
++			remove(p);
++			plat_log("Library: %s: usual settings\n", g->name);
++			break;
++		}
++		}
++		redraw_row(menu_game_row);
++		break;
++	case 2:
++		if (g) {
++			library_remove(g);
++			sel = -1;
++			library_save();
++			refresh();
++		}
++		break;
++	case 3:
++		if (s[1] == 0 || s[1] == 1) {
++			library_sort(s[1] == 0 ? SORT_NAME : SORT_LAST);
++			refresh();
++		}
++		break;
++	case 4:
++		_swix(Hourglass_On, 0);
++		library_scan();
++		_swix(Hourglass_Off, 0);
++		library_save();
++		refresh();
++		break;
++	case 5:
++		if (s[1] >= 0 && s[1] < library_folders()) {
++			library_remove_folder(s[1]);
++			sel = -1;
++			library_save();
++			refresh();
++		}
++		break;
++	case 6:
++		show_covers = !show_covers;
++		refresh();
++		break;
++	}
++	build();
++}
++
++/* ---- input ---- */
++
++void libwin_click(int *b)
++{
++	int r = row_at(b[1]);
++	switch (b[2]) {
++	case 2:                                /* Menu */
++		if (r >= 0 && !rows[r].head)
++			select_row(r);
++		menu_game_row = sel;
++		build();
++		ui_menu_is_libwin();
++		_swix(Wimp_CreateMenu, _INR(1, 3), &m_lib, b[0] - 64, b[1]);
++		break;
++	case 4:                                /* Select double click */
++		select_row(r);
++		play_selected();
++		break;
++	case 0x400:                            /* Select click */
++	case 0x100:                            /* Adjust click */
++		select_row(r);
++		_swix(Wimp_SetCaretPosition, _INR(0, 5), win, -1, 0, 0, 1 << 25, -1);
++		break;
++	}
++}
++
++int libwin_key(int code)
++{
++	int i;
++	switch (code) {
++	case 13:
++		play_selected();
++		return 1;
++	case 0x18E:                            /* down */
++	case 0x18F:                            /* up */
++		i = sel;
++		do {
++			i += code == 0x18E ? 1 : -1;
++		} while (i >= 0 && i < nrows && rows[i].head);
++		if (i < 0 || i >= nrows) {
++			for (i = 0; i < nrows && rows[i].head; i++)
++				;
++			if (sel >= 0)
++				return 1;
++		}
++		if (i < nrows) {
++			select_row(i);
++			scroll_to(i);
++		}
++		return 1;
++	}
++	return 0;
++}
++
++/* ---- from the rest of PCSX ---- */
++
++int libwin_dataload(const char *ro_path, int filetype)
++{
++	char path[1024];
++	if (filetype != 0x1000 && filetype != 0x2000)
++		return 0;
++	if (__unixify_std(ro_path, path, sizeof path, 0) == NULL)
++		return 1;
++	_swix(Hourglass_On, 0);
++	if (!library_add_folder(path))
++		plat_log("Library: %s is already there (or there are too many folders)\n", path);
++	_swix(Hourglass_Off, 0);
++	library_save();
++	libwin_open();
++	return 1;
++}
++
++void libwin_settings_file(const char *path, char *buf, int len)
++{
++	struct game *g = library_find(path), tmp;
++	buf[0] = 0;
++	if (g == NULL) {
++		memset(&tmp, 0, sizeof tmp);
++		snprintf(tmp.path, sizeof tmp.path, "%s", path);
++		library_read_serial(path, tmp.serial, sizeof tmp.serial);
++		g = &tmp;
++	}
++	library_settings_path(g, buf, len);
++}
++
++void libwin_played(const char *path, const char *serial)
++{
++	library_note_played(path, serial);
++	library_save();
++	sel = -1;
++	refresh();
++}
+diff --git a/frontend/riscos/rofe.h b/frontend/riscos/rofe.h
+index 546ce93e..201345b8 100644
+--- a/frontend/riscos/rofe.h
++++ b/frontend/riscos/rofe.h
+@@ -77,7 +77,10 @@ void host_shutdown(void);
+ int host_load_game(const char *unix_path);  /* 1 = loaded */
+ void host_unload_game(void);
+ int host_game_loaded(void);
+-const char *host_game_name(void);
++const char *host_game_name(void);          /* for showing */
++const char *host_disc_serial(void);         /* e.g. SLES02574, or "" */
++/* library.c: a file name made safe for RISC OS (save states, settings) */
++void rofe_safe_name(const char *path, char *out, int len);
+ void host_reset(void);
+ void host_run_frame(int have_focus);        /* one emulated frame */
+ double host_fps(void);
+diff --git a/frontend/riscos/ui.h b/frontend/riscos/ui.h
+new file mode 100644
+index 00000000..83ad1f82
+--- /dev/null
++++ b/frontend/riscos/ui.h
+@@ -0,0 +1,53 @@
++/*
++ * What wimp.c (the game windows and the poll loop) and libwin.c (the
++ * games library window) share.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#ifndef UI_H
++#define UI_H
++
++#define TASK_WORD 0x4B534154
++
++/* Menus are built in code; every item's text is indirected. */
++struct menu_item { int flags, submenu, icon_flags; int data[3]; };
++struct menu {
++	char title[12];
++	unsigned char colours[4];
++	int width, height, gap;
++	struct menu_item item[20];
++};
++#define ITEM_TICK 1
++#define ITEM_DOTTED 2
++#define ITEM_LAST 0x80
++#define ICON_SHADED (1 << 22)
++
++/* wimp.c */
++int ui_eig_x(void);
++int ui_eig_y(void);
++int ui_screen_w(void);                 /* pixels */
++int ui_screen_h(void);
++void ui_report(const char *msg);
++void ui_play(const char *unix_path);   /* load (with its settings) and show */
++void ui_start_task(const char *cmd);
++void ui_menu_is_libwin(void);          /* the menu just opened is libwin's */
++
++/* libwin.c */
++void libwin_init(void);
++void libwin_open(void);
++int libwin_window(void);
++void libwin_redraw(int *block);
++void libwin_open_request(int *block);
++void libwin_click(int *block);
++int libwin_key(int code);              /* 1 if it was ours */
++void libwin_menu_select(const int *sel);
++void libwin_menu_rebuild(void);        /* for Adjust-clicks */
++void *libwin_menu(void);               /* the menu tree's top, for reopening */
++/* a file or folder dropped on PCSX: 1 if the library took it (a folder) */
++int libwin_dataload(const char *ro_path, int filetype);
++/* the settings file to layer over Choices for this game (or "") */
++void libwin_settings_file(const char *unix_path, char *buf, int len);
++void libwin_played(const char *unix_path, const char *serial);
++void libwin_mode_changed(void);
++
++#endif
+diff --git a/frontend/riscos/wimp.c b/frontend/riscos/wimp.c
+index 2ac7fbe3..6104db1f 100644
+--- a/frontend/riscos/wimp.c
++++ b/frontend/riscos/wimp.c
+@@ -25,13 +25,13 @@
+ #include <unixlib/local.h>
+ #include "libretro.h"
+ #include "rofe.h"
++#include "ui.h"
+ 
+ /* The heap goes in a dynamic area named after us, up to 96 MB. */
+ const char *const __dynamic_da_name = "PCSX Heap";
+ int __dynamic_da_max_size = 96 << 20;
+ 
+ #define APP "PCSX"
+-#define TASK_WORD 0x4B534154
+ 
+ #define Message_Quit        0
+ #define Message_DataLoad    3
+@@ -408,23 +408,11 @@ static void show(int full)
+ 
+ /* ---- menus (built in code; every item's text indirected) ---- */
+ 
+-struct menu_item { int flags, submenu, icon_flags; int data[3]; };
+-struct menu {
+-	char title[12];
+-	unsigned char colours[4];
+-	int width, height, gap;
+-	struct menu_item item[12];
+-};
+-
+-#define ITEM_TICK 1
+-#define ITEM_DOTTED 2
+-#define ITEM_LAST 0x80
+-#define ICON_SHADED (1 << 22)
+-
+ static struct menu m_icon, m_win, m_scale, m_slot, m_info;
+ static char m_text[48][32];
+ static int m_ntext;
+ static struct menu *open_menu;
++static int libwin_menu_open;
+ 
+ static void menu_init(struct menu *m, const char *t)
+ {
+@@ -470,11 +458,12 @@ static void build_menus(void)
+ 
+ 	menu_init(&m_icon, APP);
+ 	menu_add(&m_icon, 0, "Info", 0, &m_info);
+-	menu_add(&m_icon, 1, "Help...", 0, NULL);
+-	menu_add(&m_icon, 2, "Choices...", 0, NULL);
+-	menu_add(&m_icon, 3, "Reload choices", 0, NULL);
+-	menu_add(&m_icon, 4, "Log...", ITEM_DOTTED, NULL);
+-	menu_add(&m_icon, 5, "Quit", 0, NULL);
++	menu_add(&m_icon, 1, "Games library", 0, NULL);
++	menu_add(&m_icon, 2, "Help...", 0, NULL);
++	menu_add(&m_icon, 3, "Choices...", 0, NULL);
++	menu_add(&m_icon, 4, "Reload choices", 0, NULL);
++	menu_add(&m_icon, 5, "Log...", ITEM_DOTTED, NULL);
++	menu_add(&m_icon, 6, "Quit", 0, NULL);
+ 
+ 	menu_init(&m_scale, "Scale");
+ 	for (i = 1; i <= 6; i++) {
+@@ -507,6 +496,7 @@ static void show_menu(struct menu *m, int x, int y)
+ {
+ 	build_menus();
+ 	open_menu = m;
++	libwin_menu_open = 0;
+ 	_swix(Wimp_CreateMenu, _INR(1, 3), m, x, y);
+ }
+ 
+@@ -517,13 +507,40 @@ static void start_task(const char *cmd)
+ 
+ /* ---- games ---- */
+ 
++static char game_path[1024];        /* the game loaded, for its settings */
++
++/* Choices: the defaults, the user's, then the game's own settings */
++static void apply_choices(const char *unix_path)
++{
++	choices_clear();
++	choices_load("/<PCSX$Dir>/Resources/Choices");
++	choices_load("/<Choices$Write>/PCSX/Choices");
++	if (unix_path && unix_path[0]) {
++		char gp[700];
++		libwin_settings_file(unix_path, gp, sizeof gp);
++		if (gp[0] && choices_load(gp))
++			plat_log("Settings for this game from %s\n", gp);
++	}
++	host_reload_choices();
++}
++
+ static void load_game(const char *unix_path)
+ {
+-	if (!host_load_game(unix_path)) {
++	char path[1024];
++	snprintf(path, sizeof path, "%s", unix_path);
++	apply_choices(path);
++	if (!host_load_game(path)) {
+ 		char msg[300];
+-		snprintf(msg, sizeof msg, "PCSX couldn't load %s (see the log)", unix_path);
++		snprintf(msg, sizeof msg, "PCSX couldn't load %.200s (see the log)", path);
+ 		report(msg);
++		game_path[0] = 0;
++		return;
++	} else {
++		snprintf(game_path, sizeof game_path, "%s", path);
++		libwin_played(path, host_disc_serial());
+ 	}
++	t_title = plat_time_cs();
++	fps_frames = 0;
+ 	{
+ 		int rate = host_audio_rate();
+ 		int ms = host_setting_int("audio.latency", 80);
+@@ -594,10 +611,7 @@ static void load_ro_path(const char *ro_path)
+ 
+ static void reload_choices(void)
+ {
+-	choices_clear();
+-	choices_load("/<PCSX$Dir>/Resources/Choices");
+-	choices_load("/<Choices$Write>/PCSX/Choices");
+-	host_reload_choices();
++	apply_choices(host_game_loaded() ? game_path : NULL);
+ }
+ 
+ /* ---- running ---- */
+@@ -663,6 +677,17 @@ static int run_frames(void)
+ 	return n;
+ }
+ 
++/* ---- for libwin.c (ui.h) ---- */
++
++int ui_eig_x(void) { return eigx; }
++int ui_eig_y(void) { return eigy; }
++int ui_screen_w(void) { return scr_w; }
++int ui_screen_h(void) { return scr_h; }
++void ui_report(const char *msg) { report(msg); }
++void ui_play(const char *unix_path) { load_game(unix_path); }
++void ui_start_task(const char *cmd) { start_task(cmd); }
++void ui_menu_is_libwin(void) { libwin_menu_open = 1; open_menu = NULL; }
++
+ /* ---- events ---- */
+ 
+ static int quit;
+@@ -674,17 +699,21 @@ static void message(int *b, int reason)
+ 		quit = 1;
+ 		break;
+ 	case Message_DataLoad:
+-		if (b[5] == win_desk || b[5] == win_full || b[5] == -2) {
++		if (b[5] == win_desk || b[5] == win_full || b[5] == -2 ||
++		    b[5] == libwin_window()) {
+ 			char path[256];
++			int type = b[10];
+ 			snprintf(path, sizeof path, "%s", (char *)&b[11]);
+ 			b[3] = b[2];
+ 			b[4] = Message_DataLoadAck;
+ 			_swix(Wimp_SendMessage, _INR(0, 2), 17, b, b[1]);
+-			load_ro_path(path);
++			if (!libwin_dataload(path, type))      /* a folder: the library's */
++				load_ro_path(path);
+ 		}
+ 		break;
+ 	case Message_ModeChange:
+ 		read_mode();
++		libwin_mode_changed();
+ 		if (!closed)
+ 			show(fullscreen);
+ 		break;
+@@ -735,13 +764,23 @@ static void menu_select(int *sel)
+ 	int ptr[5];
+ 	struct menu *m = open_menu;
+ 
++	if (libwin_menu_open) {
++		libwin_menu_select(sel);
++		if (_swix(Wimp_GetPointerInfo, _IN(1), ptr) == NULL && (ptr[2] & 1)) {
++			libwin_menu_rebuild();
++			_swix(Wimp_CreateMenu, _INR(1, 3), libwin_menu(), 0, 0);
++			_swix(Wimp_CreateMenu, _INR(1, 3), libwin_menu(), ptr[0] - 64, ptr[1]);
++		}
++		return;
++	}
+ 	if (m == &m_icon) {
+ 		switch (sel[0]) {
+-		case 1: start_task("Filer_Run <PCSX$Dir>.!Help"); break;
+-		case 2: start_task("Filer_Run <Choices$Write>.PCSX.Choices"); break;
+-		case 3: reload_choices(); read_mode(); if (!closed) show(fullscreen); break;
+-		case 4: if (log_frames) start_task("Filer_Run <Wimp$ScrapDir>.pcsxlog"); break;
+-		case 5: quit = 1; break;
++		case 1: libwin_open(); break;
++		case 2: start_task("Filer_Run <PCSX$Dir>.!Help"); break;
++		case 3: start_task("Filer_Run <Choices$Write>.PCSX.Choices"); break;
++		case 4: reload_choices(); read_mode(); if (!closed) show(fullscreen); break;
++		case 5: if (log_frames) start_task("Filer_Run <Wimp$ScrapDir>.pcsxlog"); break;
++		case 6: quit = 1; break;
+ 		}
+ 	} else if (m == &m_win) {
+ 		switch (sel[0]) {
+@@ -784,12 +823,19 @@ static void event(int reason, int *b)
+ 	case 0:          /* null */
+ 		break;
+ 	case 1:          /* redraw */
+-		redraw(b);
++		if (b[0] == libwin_window())
++			libwin_redraw(b);
++		else
++			redraw(b);
+ 		break;
+ 	case 2:          /* open */
+ 		_swix(Wimp_OpenWindow, _IN(1), b);
+ 		break;
+ 	case 3:          /* close */
++		if (b[0] == libwin_window()) {
++			close_window(b[0]);
++			break;
++		}
+ 		close_window(b[0]);
+ 		if (b[0] == win_full)
+ 			show(0);
+@@ -801,9 +847,13 @@ static void event(int reason, int *b)
+ 	case 6:          /* mouse click */
+ 		if (b[3] == -2) {
+ 			if (b[2] == 2)
+-				show_menu(&m_icon, b[0] - 64, 96 + 44 * 6);
+-			else if (b[2] == 4 || b[2] == 1)
++				show_menu(&m_icon, b[0] - 64, 96 + 44 * 7);
++			else if (b[2] == 4)        /* Select: the library */
++				libwin_open();
++			else if (b[2] == 1)        /* Adjust: the game */
+ 				show(fullscreen);
++		} else if (b[3] == libwin_window()) {
++			libwin_click(b);
+ 		} else if (b[3] == win_desk || b[3] == win_full) {
+ 			if (b[2] == 2)
+ 				show_menu(&m_win, b[0] - 64, b[1]);
+@@ -812,7 +862,11 @@ static void event(int reason, int *b)
+ 		}
+ 		break;
+ 	case 8:          /* key */
+-		key(b[6]);
++		if (b[0] == libwin_window()) {
++			if (!libwin_key(b[6]))
++				_swix(Wimp_ProcessKey, _IN(0), b[6]);
++		} else
++			key(b[6]);
+ 		break;
+ 	case 9:          /* menu selection */
+ 		menu_select(b);
+@@ -881,8 +935,11 @@ int main(int argc, char **argv)
+ 	host_init("/<Choices$Write>/PCSX/bios", "/<Choices$Write>/PCSX/saves",
+ 	          "/<Choices$Write>/PCSX/states", frame_buffer);
+ 
++	libwin_init();
+ 	if (argc > 1 && argv[1][0])
+ 		load_ro_path(argv[1]);
++	else
++		libwin_open();
+ 
+ 	t_stats = t_title = t_flush = plat_time_cs();
+ 	while (!quit) {
+-- 
+2.43.0
+

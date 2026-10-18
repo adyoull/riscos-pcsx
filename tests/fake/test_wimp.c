@@ -31,7 +31,10 @@ int host_init(const char *s, const char *sv, const char *st, host_fb_func fb)
 	return 1;
 }
 void host_shutdown(void) {}
-int host_load_game(const char *p) { snprintf(loaded_path, sizeof loaded_path, "%s", p); loaded = 1; return 1; }
+static int nloads;
+static char loadlist[4][512];
+int host_load_game(const char *p) { snprintf(loaded_path, sizeof loaded_path, "%s", p); if (nloads < 4) snprintf(loadlist[nloads++], 512, "%s", p); loaded = 1; return 1; }
+const char *host_disc_serial(void) { return ""; }
 void host_unload_game(void) { loaded = 0; }
 int host_game_loaded(void) { return loaded; }
 const char *host_game_name(void) { return "Game"; }
@@ -84,7 +87,24 @@ char *__unixify_std(const char *n, char *b, size_t l, int t)
 #define MAXW 4
 static struct { int block[23]; int open, vis[4], scroll[2], ext[4]; } win[MAXW];
 static int nwin, caret_w = -1, iconbar_icons, task_started, menus_made, processed;
-static int closed_down;
+static int closed_down, textops, others;
+static FILE *drawlog;
+static unsigned gcol;
+static int px, py;
+static const _kernel_oserror *other(int swi, int r[10])
+{
+	others++;
+	if (!drawlog)
+		drawlog = fopen("/tmp/pcsx-draw.log", "w");
+	if (swi == 0x40743)
+		gcol = (unsigned)r[0];
+	else if (swi == 0x45) {
+		if (r[0] == 4) { px = r[1]; py = r[2]; }
+		else if (r[0] == 101 && drawlog)
+			fprintf(drawlog, "fill %d %d %d %d %08x\n", px, py, r[1], r[2], gcol);
+	}
+	return NULL;
+}
 static char started[256];
 static int sprite_ok, plots, plot_x, plot_y, plot_scale[4], last_scale[4], last_x;
 static const int *menu_last;
@@ -134,14 +154,17 @@ static const _kernel_oserror *wimp(int swi, int r[10])
 		break;
 	case 0x400C7:   /* Wimp_Poll */
 	case 0x400E1:   /* Wimp_PollIdle */
-		if (iscript == 4) {
+		if (iscript == 8) {
 			/* the dropped file turns up a little late (as from SparkFS) */
 			FILE *f = fopen("/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue", "w");
 			if (f) fclose(f);
-			CHECK(!loaded, "not loaded before the file opens");
+			CHECK(nloads == 1, "the late file isn't loaded before it opens");
 		}
 		if (iscript < nscript) {
 			memcpy((int *)r[1], script[iscript].b, sizeof script[iscript].b);
+			/* y = -12345: 100 OS units below the library window's top */
+			if (script[iscript].reason == 6 && ((int *)r[1])[1] == -12345)
+				((int *)r[1])[1] = win[2].vis[3] - 100;
 			r[0] = script[iscript].reason;
 			iscript++;
 		} else {
@@ -158,6 +181,7 @@ static const _kernel_oserror *wimp(int swi, int r[10])
 		/* one rectangle: the visible area */
 		memcpy(&b[1], win[i].vis, 16);
 		memcpy(&b[5], win[i].scroll, 8);
+		memcpy(&b[7], win[i].vis, 16);         /* graphics window = all of it */
 		r[0] = win[i].open;
 		break;
 	case 0x400CA:   /* Wimp_GetRectangle */
@@ -196,6 +220,16 @@ static const _kernel_oserror *wimp(int swi, int r[10])
 	case 0x400DE:   /* Wimp_StartTask */
 		snprintf(started, sizeof started, "%s", (char *)r[0]);
 		task_started++;
+		break;
+	case 0x400F9:   /* Wimp_TextOp */
+		if (r[0] == 2) {
+			textops++;
+			if (!drawlog)
+				drawlog = fopen("/tmp/pcsx-draw.log", "w");
+			if (drawlog)
+				fprintf(drawlog, "text %d %d %s\n", r[4], r[5], (char *)r[1]);
+		} else if (r[0] == 0 && drawlog)
+			fprintf(drawlog, "colour %08x\n", (unsigned)r[1]);
 		break;
 	case 0x400DF:   /* Wimp_ReportError */
 		fprintf(stderr, "ReportError: %s\n", ((_kernel_oserror *)r[0])->errmess);
@@ -247,21 +281,50 @@ int main(void)
 	int i;
 
 	fake_reset();
-	for (i = 0x400C0; i <= 0x400EF; i++)
-		fake_swi(i, NULL, wimp);
+	{
+		static const int w[] = { 0x400C0, 0x400C1, 0x400C2, 0x400C5, 0x400C6, 0x400C7,
+			0x400C8, 0x400C9, 0x400CA, 0x400CB, 0x400CF, 0x400D1, 0x400D2, 0x400D3,
+			0x400D4, 0x400D7, 0x400DC, 0x400DD, 0x400DE, 0x400DF, 0x400E0, 0x400E1,
+			0x400E7, 0x400F9, 0 };
+		for (i = 0; w[i]; i++)
+			fake_swi(w[i], NULL, wimp);
+		fake_swi(0x40743, "ColourTrans_SetGCOL", other);
+		fake_swi(0x45, "OS_Plot", other);
+		fake_swi(0x49980, "JPEG_Info", other);
+		fake_swi(0x49982, "JPEG_PlotScaled", other);
+		fake_swi(0x406C0, "Hourglass_On", other);
+		fake_swi(0x406C1, "Hourglass_Off", other);
+	}
 	fake_swi(OS_ReadModeVariable, "OS_ReadModeVariable", readmodevar);
 	fake_swi(OS_SpriteOp, "OS_SpriteOp", spriteop);
 	fake_swi(OS_Byte, "OS_Byte", osbyte);
 	/* wimp.c sends stderr to the log: the results end up there too */
 	/* the dropped file: present (an archive that's slow to open is tested by
 	   the delay below) */
-	system("mkdir -p '/tmp/pcsxtest/ADFS::4/$/Games' && rm -f '/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue'");
+	system("rm -rf '/tmp/pcsxtest' '/<Choices$Write>' && mkdir -p '/tmp/pcsxtest/ADFS::4/$/Games' "
+	       "'/<Choices$Write>/PCSX/games' && touch '/tmp/pcsxtest/ADFS::4/$/Games/Lib.cue'");
 	setenv("PCSX$Log", getenv("TEST_LOG") ? getenv("TEST_LOG") : "/tmp/test_wimp.log", 1);
 
-	/* 1: click the icon bar (Select): the window opens, centred */
-	memset(b, 0, sizeof b); b[0] = 1500; b[2] = 4; b[3] = -2;
+	/* the library window is open at the start (no game given) */
+	/* 1: drag a folder into the library: its game is listed */
+	memset(b, 0, sizeof b);
+	b[0] = 256; b[1] = 0x99; b[2] = 0x55; b[4] = 3; b[5] = 0x1002; b[10] = 0x1000;
+	strcpy((char *)&b[11], "ADFS::4.$.Games");
+	add_event(17, b, 30);
+	memset(b, 0, sizeof b); b[0] = 0x1002; add_event(1, b, 1);       /* redraw */
+	/* (after playing, redraw again: the game is in Recently played) */
+	/* 2: double click its row: it plays */
+	memset(b, 0, sizeof b); b[0] = 500; b[1] = -12345; b[2] = 4; b[3] = 0x1002;
 	add_event(6, b, 5);
-	/* 2: drag a disc image onto the icon bar */
+	/* 3: menu on the row: Game settings > High resolution */
+	memset(b, 0, sizeof b); b[0] = 500; b[1] = -12345; b[2] = 2; b[3] = 0x1002;
+	add_event(6, b, 5);
+	memset(b, 0, sizeof b); b[0] = 1; b[1] = 0; b[2] = -1; add_event(9, b, 3);
+	memset(b, 0, sizeof b); b[0] = 0x1002; add_event(1, b, 1);       /* redraw again */
+	/* 4: Adjust on the icon bar: the game window */
+	memset(b, 0, sizeof b); b[0] = 1500; b[2] = 1; b[3] = -2;
+	add_event(6, b, 5);
+	/* 5: drag a disc image onto the icon bar (it turns up a little late) */
 	memset(b, 0, sizeof b);
 	b[0] = 256; b[1] = 0x99; b[2] = 0x55; b[3] = 0; b[4] = 3; b[5] = -2;
 	strcpy((char *)&b[11], "ADFS::4.$.Games.Tri/cue");
@@ -290,7 +353,28 @@ int main(void)
 
 	CHECK(wimp_main(1, argv) == 0, "runs and quits");
 
-	CHECK(nwin == 2, "two windows: desktop and full screen");
+	CHECK(nwin == 3, "three windows: desktop, full screen, library");
+	CHECK(win[2].block[7] == (int)0xBF000002, "library window: scroll bar, size icon");
+	CHECK(textops > 0, "library rows drawn");
+	CHECK(nloads == 2 && strstr(loadlist[0], "/Games/Lib.cue") && strstr(loadlist[1], "/Games/Tri.cue"),
+	      "the library's game played, then the dropped one");
+	{
+		FILE *f = fopen("/<Choices$Write>/PCSX/games/Lib", "r");
+		char line[200] = "";
+		int found = 0;
+		while (f && fgets(line, sizeof line, f))
+			if (strstr(line, "pcsx_rearmed_neon_enhancement_enable: enabled"))
+				found = 1;
+		if (f) fclose(f);
+		CHECK(found, "per-game setting written");
+		f = fopen("/<Choices$Write>/PCSX/Library", "r");
+		found = 0;
+		while (f && fgets(line, sizeof line, f))
+			if (strstr(line, "folder: /tmp/pcsxtest/ADFS::4/$/Games") || strstr(line, "Tri.cue"))
+				found++;
+		if (f) fclose(f);
+		CHECK(found == 2, "library file: the folder, and the dropped game as played");
+	}
 	CHECK(win[0].block[7] == (int)0x87000002, "desktop window: title, back, close, movable");
 	CHECK((win[0].block[14] & 0x100) && win[0].block[18] != 0, "indirected title");
 	CHECK(win[1].block[7] == (int)0x80000020, "full screen window: no furniture");

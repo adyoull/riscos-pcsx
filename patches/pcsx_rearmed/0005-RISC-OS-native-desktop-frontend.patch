@@ -1,7 +1,7 @@
 From 5da543aa088e43d131f35b65befb233df6fe4d87 Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
-Subject: [PATCH 5/6] RISC OS: native desktop frontend
+Subject: [PATCH 5/7] RISC OS: native desktop frontend
 
 A Wimp task (no SDL): icon bar, game window, full screen window,
 menus, drag and drop of disc images, frames plotted from a 32bpp

@@ -1,7 +1,7 @@
 From 510f5aadedbed4044b4faf9bd160e9e3f34b06ad Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
-Subject: [PATCH 3/6] RISC OS: 32bpp frames as RISC OS sprite images (TBGR)
+Subject: [PATCH 3/7] RISC OS: 32bpp frames as RISC OS sprite images (TBGR)
 
 The frontend draws frames as a 32bpp sprite: red in the low byte.
 With ROFE_TBGR (or on RISC OS) the XRGB8888 converters write that

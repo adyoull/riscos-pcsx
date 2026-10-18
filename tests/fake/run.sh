@@ -12,9 +12,10 @@ grep -E "^FAIL" "$OUT/test_plat.log" && exit 1 || true
 arm-linux-gnueabihf-gcc -g -O1 -Wall -funsigned-char -D__riscos -D__FAKE_RISCOS \
   -I"$F" -I"$FE" -I"$HERE/include" -I"$SRC/deps/libretro-common/include" -no-pie \
   -c -Dmain=wimp_main -o "$OUT/wimp.o" "$FE/wimp.c"
+arm-linux-gnueabihf-gcc -g -O1 -Wall -funsigned-char -D__riscos -D__FAKE_RISCOS -I"$F" -I"$FE" -I"$HERE/include" -no-pie -c -o "$OUT/libwin.o" "$FE/libwin.c"
 arm-linux-gnueabihf-gcc -g -O1 -Wall -funsigned-char -D__riscos -D__FAKE_RISCOS \
   -I"$F" -I"$FE" -I"$HERE/include" -no-pie -o "$OUT/test_wimp" "$HERE/test_wimp.c" \
-  "$OUT/wimp.o" "$FE/choices.c" "$FE/keys.c" "$F/riscos.c"
+  "$OUT/wimp.o" "$OUT/libwin.o" "$FE/library.c" "$FE/choices.c" "$FE/keys.c" "$F/riscos.c"
 TEST_LOG=$OUT/test_wimp.log PATH=$RCD/toolchain/env/bin:$PATH "$RCD/qemu/aligntrap.sh" "$OUT/test_wimp" || true
 tail -1 "$OUT/test_wimp.log"
 grep -E "^FAIL" "$OUT/test_wimp.log" && exit 1 || true

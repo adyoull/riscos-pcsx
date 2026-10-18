@@ -1,7 +1,7 @@
 From b9b44f2bc8f533b2b313cd1bf3a9319a65458305 Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 17:10:00 +0100
-Subject: [PATCH 6/6] psxMap without mmap: page-aligned memory
+Subject: [PATCH 6/7] psxMap without mmap: page-aligned memory
 
 The NEON GPU's enhancement (high resolution) buffer is read and written
 with :128 alignment hints; calloc gives 8-byte alignment, which faults.

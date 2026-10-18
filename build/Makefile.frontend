@@ -4,12 +4,12 @@ CC = arm-riscos-gnueabihf-gcc
 CFLAGS = -DROFE_VERSION=\"$(VERSION)\" -O2 -marm -mtune=cortex-a72 -mfpu=neon -mfloat-abi=hard \
 	-fstack-clash-protection -Wall -Wno-unused-function \
 	-I$(SRC)/deps/libretro-common/include -I$(SRC)/frontend/riscos
-FE = host choices keys plat_riscos wimp
+FE = host choices keys plat_riscos wimp library libwin
 OBJS = $(FE:%=$(OUT)/fe_%.o)
 
 $(OUT)/pcsx.elf: $(OBJS) $(CORE)
 	$(CC) $(CFLAGS) -static -o $@ $(OBJS) $(CORE) -lm
 
-$(OUT)/fe_%.o: $(SRC)/frontend/riscos/%.c $(SRC)/frontend/riscos/rofe.h
+$(OUT)/fe_%.o: $(SRC)/frontend/riscos/%.c $(SRC)/frontend/riscos/rofe.h $(SRC)/frontend/riscos/ui.h $(SRC)/frontend/riscos/library.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -c -o $@ $<

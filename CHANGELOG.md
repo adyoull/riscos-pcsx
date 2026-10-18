@@ -1,5 +1,23 @@
 # Changelog
 
+## r26-riscos5test (2026-10-18)
+- Games library window (the icon bar icon opens it; Adjust opens the game):
+  folders dragged in are scanned (subfolders too; a .cue's .bin and an
+  .m3u's discs are one game), played games are added, "Recently played"
+  at the top, then all games by name or last played. Each row: cover,
+  title, region and serial (read from the disc's SYSTEM.CNF; .chd and
+  .pbp when first played), last played, save states, own settings.
+  Double-click or Return plays. Menu: Play, Game settings, Remove, Sort,
+  Rescan, Folders, Show covers. Kept in <Choices$Write>.PCSX.Library.
+- Covers: JPEGs (SpriteExtend's JPEG_PlotScaled) next to the disc, in a
+  covers folder beside it, or in <Choices$Write>.PCSX.covers by serial or
+  name.
+- Per-game settings (high resolution, dynarec, built-in BIOS, full screen,
+  pad 1 type) in <Choices$Write>.PCSX.games.<serial>, layered over Choices
+  when the game starts.
+- The title bar shows the game's name with spaces (not underscores).
+- The fps counter starts afresh when a game loads.
+
 ## r26-riscos4test (2026-10-18)
 - The title bar now shows emulated frames a second (60, or 50 for PAL),
   the game's speed; still screens showed "0 fps" before. The log still
