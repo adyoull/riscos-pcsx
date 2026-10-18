@@ -55,6 +55,11 @@ unsigned plat_time_cs(void)
 	return fake_cs;
 }
 
+unsigned plat_time_us(void)
+{
+	return fake_cs * 10000u;
+}
+
 void plat_log(const char *fmt, ...)
 {
 	va_list ap;

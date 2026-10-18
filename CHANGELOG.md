@@ -1,5 +1,13 @@
 # Changelog
 
+## r26-riscos2test (2026-10-18)
+After the first Pi log (dynarec, sound and pacing working):
+- "Frames:" timings in microseconds (UnixLib's CLOCK_MONOTONIC); they read
+  0.0 ms with the centisecond clock. Also counts Wimp polls.
+- A dropped file that won't open (SparkFS archives on a network share, the
+  first time) is retried for up to a second before loading.
+- Core options are logged once, then only when Choices changes one.
+
 ## r26-riscos1test (2026-10-18)
 First test build.
 - PCSX ReARMed master 8b6c1635 (r26-89) as a static libretro core for RISC OS:

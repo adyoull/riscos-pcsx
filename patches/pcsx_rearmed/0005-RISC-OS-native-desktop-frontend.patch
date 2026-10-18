@@ -1,4 +1,4 @@
-From 43efa49211197792611c08761a8f8d3eba4ee959 Mon Sep 17 00:00:00 2001
+From 3fa5b003f5879c02fdf73f4d92ee8816e3b1c799 Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
 Subject: [PATCH 5/5] RISC OS: native desktop frontend
@@ -10,12 +10,12 @@ StreamManager (paced by the sound), keyboard by OS_Byte 121 scans,
 USB game pads through USBJoystick's API, save states, Choices.
 ---
  frontend/riscos/choices.c     |  93 ++++
- frontend/riscos/host.c        | 825 ++++++++++++++++++++++++++++++++
+ frontend/riscos/host.c        | 829 +++++++++++++++++++++++++++++++
  frontend/riscos/keys.c        |  60 +++
- frontend/riscos/plat_riscos.c | 453 ++++++++++++++++++
- frontend/riscos/rofe.h        |  97 ++++
- frontend/riscos/wimp.c        | 872 ++++++++++++++++++++++++++++++++++
- 6 files changed, 2400 insertions(+)
+ frontend/riscos/plat_riscos.c | 463 ++++++++++++++++++
+ frontend/riscos/rofe.h        |  98 ++++
+ frontend/riscos/wimp.c        | 892 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 2435 insertions(+)
  create mode 100644 frontend/riscos/choices.c
  create mode 100644 frontend/riscos/host.c
  create mode 100644 frontend/riscos/keys.c
@@ -124,10 +124,10 @@ index 00000000..0408ab79
 +}
 diff --git a/frontend/riscos/host.c b/frontend/riscos/host.c
 new file mode 100644
-index 00000000..f5b45ea9
+index 00000000..5dd4f71c
 --- /dev/null
 +++ b/frontend/riscos/host.c
-@@ -0,0 +1,825 @@
+@@ -0,0 +1,829 @@
 +/*
 + * The libretro host for !PCSX: everything between the core
 + * (frontend/libretro.c) and the desktop (wimp.c).
@@ -166,7 +166,7 @@ index 00000000..f5b45ea9
 +};
 +static struct opt opts[MAX_OPTS];
 +static int nopts;
-+static int opts_changed;
++static int opts_changed, opts_logged;
 +
 +/* This frontend's defaults, where the core's don't suit RISC OS. */
 +static const char *const fe_defaults[][2] = {
@@ -241,8 +241,11 @@ index 00000000..f5b45ea9
 +			o->value[len] = 0;
 +		} else
 +			snprintf(o->value, sizeof o->value, "%s", v);
-+		if (strcmp(old, o->value) != 0)
++		if (strcmp(old, o->value) != 0) {
 +			opts_changed = 1;
++			if (opts_logged)
++				plat_log("Option %s: %s -> %s\n", o->key, old, o->value);
++		}
 +	}
 +}
 +
@@ -797,10 +800,11 @@ index 00000000..f5b45ea9
 +		return 0;
 +	}
 +	game_loaded = 1;
-+	{
++	if (!opts_logged) {      /* once; reload_choices logs the changes */
 +		int i;
 +		for (i = 0; i < nopts; i++)
 +			plat_log("Option %s: %s\n", opts[i].key, opts[i].value);
++		opts_logged = 1;
 +	}
 +	for (p = 0; p < ROFE_MAX_PADS; p++) {
 +		pad_device[p] = pad_type_from_choices(p);
@@ -1021,10 +1025,10 @@ index 00000000..3e62bbd1
 +}
 diff --git a/frontend/riscos/plat_riscos.c b/frontend/riscos/plat_riscos.c
 new file mode 100644
-index 00000000..ed736134
+index 00000000..a8b8ad3c
 --- /dev/null
 +++ b/frontend/riscos/plat_riscos.c
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,463 @@
 +/*
 + * The plat_* calls on RISC OS (see rofe.h).
 + *
@@ -1045,6 +1049,7 @@ index 00000000..ed736134
 +#include <stdlib.h>
 +#include <string.h>
 +#include <stdarg.h>
++#include <time.h>
 +#include <kernel.h>
 +#include <swis.h>
 +#include "rofe.h"
@@ -1078,6 +1083,15 @@ index 00000000..ed736134
 +	unsigned t = 0;
 +	_swix(OS_ReadMonotonicTime, _OUT(0), &t);
 +	return t;
++}
++
++unsigned plat_time_us(void)
++{
++	/* UnixLib reads the HAL's counter for CLOCK_MONOTONIC */
++	struct timespec ts;
++	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
++		return plat_time_cs() * 10000u;
++	return (unsigned)ts.tv_sec * 1000000u + (unsigned)(ts.tv_nsec / 1000);
 +}
 +
 +/* ---- sound ---- */
@@ -1480,10 +1494,10 @@ index 00000000..ed736134
 +}
 diff --git a/frontend/riscos/rofe.h b/frontend/riscos/rofe.h
 new file mode 100644
-index 00000000..433ad237
+index 00000000..546ce93e
 --- /dev/null
 +++ b/frontend/riscos/rofe.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,98 @@
 +/*
 + * !PCSX: the RISC OS frontend for PCSX ReARMed's libretro core.
 + *
@@ -1525,6 +1539,7 @@ index 00000000..433ad237
 +/* ---- plat_*: what host.c needs from the machine ---- */
 +int plat_key_down(int inkey);                /* only called while we have focus */
 +unsigned plat_time_cs(void);                 /* monotonic, centiseconds */
++unsigned plat_time_us(void);                 /* monotonic, microseconds (wraps) */
 +void plat_log(const char *fmt, ...);
 +
 +/* Sound: 16-bit signed stereo, 44100 Hz. */
@@ -1583,10 +1598,10 @@ index 00000000..433ad237
 +#endif
 diff --git a/frontend/riscos/wimp.c b/frontend/riscos/wimp.c
 new file mode 100644
-index 00000000..55899ed5
+index 00000000..a2c7352c
 --- /dev/null
 +++ b/frontend/riscos/wimp.c
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,892 @@
 +/*
 + * !PCSX's desktop: a Wimp task with an icon bar icon, a game window and a
 + * borderless full screen window, built in code (no Templates).
@@ -1650,7 +1665,7 @@ index 00000000..55899ed5
 +static int spr_w, spr_h, spr_rows;        /* frame size; rows in the sprite */
 +
 +/* timing / stats */
-+static unsigned t_stats, frames_run, frames_shown, run_cs, show_cs;
++static unsigned t_stats, frames_run, frames_shown, run_us, show_us, polls;
 +static unsigned t_title, fps_frames;
 +static int fps_shown;
 +static unsigned t_due0;
@@ -1835,7 +1850,7 @@ index 00000000..55899ed5
 +{
 +	int b[11], more = 0;
 +	struct box fb = current_box();
-+	unsigned t0 = plat_time_cs();
++	unsigned t0 = plat_time_us();
 +	if (closed)
 +		return;
 +	b[0] = current_window();
@@ -1851,7 +1866,7 @@ index 00000000..55899ed5
 +	}
 +	frames_shown++;
 +	fps_frames++;
-+	show_cs += plat_time_cs() - t0;
++	show_us += plat_time_us() - t0;
 +}
 +
 +/* ---- windows ---- */
@@ -2127,6 +2142,25 @@ index 00000000..55899ed5
 +		return;
 +	}
 +	plat_log("Dropped %s -> %s\n", ro_path, unix_path);
++	/* A file in an archive (SparkFS) may not open the first time it's
++	   asked for: give it up to a second. */
++	{
++		int tries;
++		for (tries = 0; tries < 10; tries++) {
++			FILE *f = fopen(unix_path, "rb");
++			if (f) {
++				fclose(f);
++				break;
++			}
++			{
++				unsigned t = plat_time_cs(), spins = 0;
++				while ((int)(plat_time_cs() - t) < 10 && ++spins < 10000000)
++					;
++			}
++		}
++		if (tries)
++			plat_log("%s opened after %d tries\n", unix_path, tries + 1);
++	}
 +	load_game(unix_path);
 +}
 +
@@ -2153,18 +2187,18 @@ index 00000000..55899ed5
 +	if (!log_frames || (int)(now - t_stats) < 500)
 +		return;
 +	if (frames_run)
-+		plat_log("Frames: %u run (%.1f ms each), %u shown (%.1f ms each), sound queued %d\n",
-+		         frames_run, run_cs * 10.0 / frames_run, frames_shown,
-+		         frames_shown ? show_cs * 10.0 / frames_shown : 0.0,
++		plat_log("Frames: %u run (%.2f ms each), %u shown (%.2f ms each), %u polls, sound queued %d\n",
++		         frames_run, run_us / 1000.0 / frames_run, frames_shown,
++		         frames_shown ? show_us / 1000.0 / frames_shown : 0.0, polls,
 +		         plat_audio_queued());
-+	frames_run = frames_shown = run_cs = show_cs = 0;
++	frames_run = frames_shown = run_us = show_us = polls = 0;
 +	t_stats = now;
 +}
 +
 +/* Runs the frames that are due; returns how many. */
 +static int run_frames(void)
 +{
-+	unsigned t0 = plat_time_cs();
++	unsigned t0 = plat_time_cs(), u0 = plat_time_us();
 +	int n = 0, focus = have_focus() || fullscreen;
 +	int q = host_audio_rate() ? plat_audio_queued() : -1;
 +	int newf = 0;
@@ -2192,7 +2226,7 @@ index 00000000..55899ed5
 +	}
 +	if (n) {
 +		frames_run += n;
-+		run_cs += plat_time_cs() - t0;
++		run_us += plat_time_us() - u0;
 +		host_frame(&newf);
 +		if (newf)
 +			present();
@@ -2436,6 +2470,7 @@ index 00000000..55899ed5
 +			break;
 +		}
 +		event(reason, b);
++		polls++;
 +		if (reason == 0 && running) {
 +			now = plat_time_cs();
 +			idle = run_frames() == 0;
