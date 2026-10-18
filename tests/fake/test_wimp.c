@@ -73,7 +73,7 @@ char *__unixify_std(const char *n, char *b, size_t l, int t)
 	char *o = b;
 	(void)t;
 	CHECK(strncmp(n, "ADFS::4.$.", 10) == 0, "a RISC OS path");
-	o += snprintf(o, l, "/ADFS::4/$/");
+	o += snprintf(o, l, "/tmp/pcsxtest/ADFS::4/$/");
 	for (n += 10; *n; n++)
 		*o++ = *n == '.' ? '/' : *n == '/' ? '.' : *n;
 	*o = 0;
@@ -134,6 +134,12 @@ static const _kernel_oserror *wimp(int swi, int r[10])
 		break;
 	case 0x400C7:   /* Wimp_Poll */
 	case 0x400E1:   /* Wimp_PollIdle */
+		if (iscript == 4) {
+			/* the dropped file turns up a little late (as from SparkFS) */
+			FILE *f = fopen("/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue", "w");
+			if (f) fclose(f);
+			CHECK(!loaded, "not loaded before the file opens");
+		}
 		if (iscript < nscript) {
 			memcpy((int *)r[1], script[iscript].b, sizeof script[iscript].b);
 			r[0] = script[iscript].reason;
@@ -247,6 +253,9 @@ int main(void)
 	fake_swi(OS_SpriteOp, "OS_SpriteOp", spriteop);
 	fake_swi(OS_Byte, "OS_Byte", osbyte);
 	/* wimp.c sends stderr to the log: the results end up there too */
+	/* the dropped file: present (an archive that's slow to open is tested by
+	   the delay below) */
+	system("mkdir -p '/tmp/pcsxtest/ADFS::4/$/Games' && rm -f '/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue'");
 	setenv("PCSX$Log", getenv("TEST_LOG") ? getenv("TEST_LOG") : "/tmp/test_wimp.log", 1);
 
 	/* 1: click the icon bar (Select): the window opens, centred */
@@ -258,7 +267,7 @@ int main(void)
 	strcpy((char *)&b[11], "ADFS::4.$.Games.Tri/cue");
 	add_event(17, b, 30);
 	/* 3: null events: frames run and are shown */
-	for (i = 0; i < 6; i++)
+	for (i = 0; i < 14; i++)
 		add_event(0, b, 0);
 	/* 4: F11: full screen */
 	memset(b, 0, sizeof b); b[6] = 0x1CB;
@@ -286,8 +295,8 @@ int main(void)
 	CHECK((win[0].block[14] & 0x100) && win[0].block[18] != 0, "indirected title");
 	CHECK(win[1].block[7] == (int)0x80000020, "full screen window: no furniture");
 	CHECK(iconbar_icons == 1, "icon bar icon");
-	CHECK(strcmp(loaded_path, "/ADFS::4/$/Games/Tri.cue") == 0, "dropped file, Unix form");
-	if (strcmp(loaded_path, "/ADFS::4/$/Games/Tri.cue"))
+	CHECK(strcmp(loaded_path, "/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue") == 0, "dropped file, Unix form");
+	if (strcmp(loaded_path, "/tmp/pcsxtest/ADFS::4/$/Games/Tri.cue"))
 		fprintf(stderr, "loaded %s\n", loaded_path);
 	/* scale: 1920x1080 -> 3 (960x720 px leaves 160) -> 1920x1440 OS units */
 	CHECK(win[0].ext[2] == 1920 && win[0].ext[1] == -1440, "extent: 320x240 x3 at eig 1");

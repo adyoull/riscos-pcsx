@@ -1,5 +1,13 @@
 # Changelog
 
+## r26-riscos4test (2026-10-18)
+- The title bar now shows emulated frames a second (60, or 50 for PAL),
+  the game's speed; still screens showed "0 fps" before. The log still
+  has both.
+- A dropped file that doesn't open (SparkFS, the first time) is tried
+  again while the desktop keeps polling, for up to 5 s, instead of in a
+  busy loop (which stopped SparkFS fetching it).
+
 ## r26-riscos3test (2026-10-18)
 - The title bar's frame rate stayed at 0 on the Pi (the log counted ~43):
   the title bar is now also redrawn the classic way (Wimp_ForceRedraw of

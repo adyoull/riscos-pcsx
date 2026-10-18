@@ -1,4 +1,4 @@
-From 63b65b47b82fb3128d4eb48f2f80c84b9a273a03 Mon Sep 17 00:00:00 2001
+From 5da543aa088e43d131f35b65befb233df6fe4d87 Mon Sep 17 00:00:00 2001
 From: Andrew Youll <adyoull@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:00:00 +0100
 Subject: [PATCH 5/6] RISC OS: native desktop frontend
@@ -10,12 +10,12 @@ StreamManager (paced by the sound), keyboard by OS_Byte 121 scans,
 USB game pads through USBJoystick's API, save states, Choices.
 ---
  frontend/riscos/choices.c     |  93 ++++
- frontend/riscos/host.c        | 829 +++++++++++++++++++++++++++++++
+ frontend/riscos/host.c        | 829 ++++++++++++++++++++++++++++++
  frontend/riscos/keys.c        |  60 +++
  frontend/riscos/plat_riscos.c | 463 +++++++++++++++++
  frontend/riscos/rofe.h        |  98 ++++
- frontend/riscos/wimp.c        | 900 ++++++++++++++++++++++++++++++++++
- 6 files changed, 2443 insertions(+)
+ frontend/riscos/wimp.c        | 928 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 2471 insertions(+)
  create mode 100644 frontend/riscos/choices.c
  create mode 100644 frontend/riscos/host.c
  create mode 100644 frontend/riscos/keys.c
@@ -1598,10 +1598,10 @@ index 00000000..546ce93e
 +#endif
 diff --git a/frontend/riscos/wimp.c b/frontend/riscos/wimp.c
 new file mode 100644
-index 00000000..32fc0a12
+index 00000000..2ac7fbe3
 --- /dev/null
 +++ b/frontend/riscos/wimp.c
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,928 @@
 +/*
 + * !PCSX's desktop: a Wimp task with an icon bar icon, a game window and a
 + * borderless full screen window, built in code (no Templates).
@@ -1865,7 +1865,6 @@ index 00000000..32fc0a12
 +		_swix(Wimp_GetRectangle, _IN(1) | _OUT(0), b, &more);
 +	}
 +	frames_shown++;
-+	fps_frames++;
 +	show_us += plat_time_us() - t0;
 +}
 +
@@ -2142,6 +2141,40 @@ index 00000000..32fc0a12
 +	show(fullscreen || host_setting_int("fullscreen", 0));
 +}
 +
++static char pending_path[1024];      /* a dropped file still to open */
++static unsigned pending_until, pending_next;
++
++static int file_opens(const char *path)
++{
++	FILE *f = fopen(path, "rb");
++	if (f == NULL)
++		return 0;
++	fclose(f);
++	return 1;
++}
++
++/* Called after every poll while a dropped file is waiting. */
++static void pending_retry(void)
++{
++	unsigned now = plat_time_cs();
++	if (!pending_path[0] || (int)(now - pending_next) < 0)
++		return;
++	pending_next = now + 10;
++	if (file_opens(pending_path)) {
++		char path[1024];
++		snprintf(path, sizeof path, "%s", pending_path);
++		pending_path[0] = 0;
++		plat_log("%s opens now\n", path);
++		load_game(path);
++	} else if ((int)(now - pending_until) >= 0) {
++		char msg[300];
++		snprintf(msg, sizeof msg, "PCSX can't open %.200s", pending_path);
++		plat_log("%s\n", msg);
++		pending_path[0] = 0;
++		report(msg);
++	}
++}
++
 +static void load_ro_path(const char *ro_path)
 +{
 +	char unix_path[1024];
@@ -2150,24 +2183,15 @@ index 00000000..32fc0a12
 +		return;
 +	}
 +	plat_log("Dropped %s -> %s\n", ro_path, unix_path);
-+	/* A file in an archive (SparkFS) may not open the first time it's
-+	   asked for: give it up to a second. */
-+	{
-+		int tries;
-+		for (tries = 0; tries < 10; tries++) {
-+			FILE *f = fopen(unix_path, "rb");
-+			if (f) {
-+				fclose(f);
-+				break;
-+			}
-+			{
-+				unsigned t = plat_time_cs(), spins = 0;
-+				while ((int)(plat_time_cs() - t) < 10 && ++spins < 10000000)
-+					;
-+			}
-+		}
-+		if (tries)
-+			plat_log("%s opened after %d tries\n", unix_path, tries + 1);
++	if (!file_opens(unix_path)) {
++		/* A file in an archive (SparkFS) may not open at first: SparkFS
++		   fetches it while the desktop runs, so keep polling and try
++		   again for a few seconds. */
++		snprintf(pending_path, sizeof pending_path, "%s", unix_path);
++		pending_until = plat_time_cs() + 500;
++		pending_next = plat_time_cs() + 10;
++		plat_log("%s doesn't open yet: trying again for 5 s\n", unix_path);
++		return;
 +	}
 +	load_game(unix_path);
 +}
@@ -2234,6 +2258,7 @@ index 00000000..32fc0a12
 +	}
 +	if (n) {
 +		frames_run += n;
++		fps_frames += n;          /* the title shows emulated frames a second */
 +		run_us += plat_time_us() - u0;
 +		host_frame(&newf);
 +		if (newf)
@@ -2471,6 +2496,8 @@ index 00000000..32fc0a12
 +		if (running)
 +			e = _swix(Wimp_PollIdle, _INR(0, 2) | _OUT(0), 0, b,
 +			          now + (idle ? 1 : 0), &reason);
++		else if (pending_path[0])
++			e = _swix(Wimp_PollIdle, _INR(0, 2) | _OUT(0), 0, b, now + 10, &reason);
 +		else
 +			e = _swix(Wimp_Poll, _INR(0, 1) | _OUT(0), 1, b, &reason);
 +		if (e) {
@@ -2479,6 +2506,7 @@ index 00000000..32fc0a12
 +		}
 +		event(reason, b);
 +		polls++;
++		pending_retry();
 +		if (reason == 0 && running) {
 +			now = plat_time_cs();
 +			idle = run_frames() == 0;
