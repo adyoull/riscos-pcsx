@@ -1,5 +1,18 @@
 # Changelog
 
+## r26-riscos7test (2026-10-18)
+- Fixed: a game stayed open after it was closed or failed to load (the
+  core's retro_unload_game does nothing), so an unpacked game couldn't be
+  deleted or unpacked again ("couldn't be created"). The disc image is now
+  closed (cdra_close) on unloading and after a failed load.
+- Fixed: CloneCD rips (.ccd/.img/.sub) in archives: the core is given the
+  .img and finds the .ccd itself (likewise .mds -> .mdf, .toc -> .bin).
+- If old unpacked files can't be deleted, the next game goes into a fresh
+  numbered folder (<Wimp$ScrapDir>.PCSXGame.1, .2...) instead of failing.
+- Tests: tests/headless takes a .zip/.7z (unpacked first) and reports
+  files left open after unloading; test_archive 112 (a CloneCD zip).
+  PCSX-tests-5 adds Packed/TriCCD/zip.
+
 ## r26-riscos6test (2026-10-18)
 - Games in .zip and .7z files: dropped on PCSX or played from the library,
   they're unpacked into <Wimp$ScrapDir>.PCSXGame about a megabyte per

@@ -176,7 +176,7 @@ static const _kernel_oserror *wimp(int swi, int r[10])
 		if (nwin && win[0].block[18] && strstr((char *)win[0].block[18], "unpacking"))
 			saw_unpacking++;
 		if (iscript == 50)          /* the second zip is being unpacked */
-			unpacked_seen = fopen(SCRAP "/Z.cue", "r") == NULL;
+			unpacked_seen = fopen(SCRAP "/1/Z.cue", "r") == NULL;
 		if (iscript == 32)
 			paused_at_close = paused_audio;
 		if (iscript < nscript) {
@@ -403,7 +403,7 @@ int main(void)
 
 	CHECK(wimp_main(1, argv) == 0, "runs and quits");
 	fprintf(stderr, "script: %d events, %d used\n", nscript, iscript);
-	CHECK(nloads == 3 && !strcmp(loadlist[2], SCRAP "/Z.cue"), "the zipped game played, unpacked");
+	CHECK(nloads == 3 && !strcmp(loadlist[2], SCRAP "/1/Z.cue"), "the zipped game played, unpacked");
 	CHECK(!strcmp(name_from, "/tmp/pcsxtest/ADFS::4/$/Zips/Zipped.zip"), "named after its zip");
 	CHECK(saw_unpacking > 0, "the title said it was unpacking");
 	CHECK(unpacked_seen, "the first game's files deleted when the second was dropped");

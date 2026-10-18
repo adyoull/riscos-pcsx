@@ -1,0 +1,150 @@
+From c9084c5d4f11fe580fc0555899d5757ed319da6f Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:10:00 +0100
+Subject: [PATCH] RISC OS: close the disc when a game is unloaded; CloneCD rips
+ in archives
+
+retro_unload_game does nothing, so the disc image (and .sub, track
+files) stayed open after a game was closed or failed to load: on RISC OS
+an open file can't be deleted, so an unpacked game couldn't be cleared
+or unpacked again. host.c now calls cdra_close() then.
+
+In an archive, a .ccd/.mds/.toc names the image the core should be given
+(.img/.mdf/.bin; it finds the description beside it itself). If old
+unpacked files still can't be deleted, the next game is unpacked into a
+fresh numbered folder.
+---
+ frontend/riscos/archive.c | 18 +++++++++++++++++-
+ frontend/riscos/host.c    |  7 +++++++
+ frontend/riscos/wimp.c    | 27 +++++++++++++++++++++++++--
+ 3 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/frontend/riscos/archive.c b/frontend/riscos/archive.c
+index ed73b655..e17a2499 100644
+--- a/frontend/riscos/archive.c
++++ b/frontend/riscos/archive.c
+@@ -426,13 +426,29 @@ static void choose_game(struct arc *a)
+ {
+ 	static const char *const prio[] = { ".m3u", ".cue", ".ccd", ".mds", ".toc", ".chd", ".pbp",
+ 	                                    ".iso", ".img", ".bin", ".exe", ".psx", NULL };
+-	int p, i;
++	/* the core is given the image, and finds these beside it itself */
++	static const char *const image_of[][2] = { { ".ccd", ".img" }, { ".mds", ".mdf" },
++	                                           { ".toc", ".bin" } };
++	int p, i, k;
+ 	a->game = -1;
+ 	for (p = 0; prio[p] && a->game < 0; p++)
+ 		for (i = 0; i < a->n; i++)
+ 			if (!a->m[i].is_dir && !strcasecmp(extof(a->m[i].name), prio[p]) &&
+ 			    (a->game < 0 || strcasecmp(a->m[i].name, a->m[a->game].name) < 0))
+ 				a->game = i;
++	for (k = 0; k < 3 && a->game >= 0; k++) {
++		const char *g = a->m[a->game].name;
++		size_t bl = strlen(g) - strlen(extof(g));
++		if (strcasecmp(extof(g), image_of[k][0]))
++			continue;
++		for (i = 0; i < a->n; i++)
++			if (!a->m[i].is_dir && strlen(a->m[i].name) == bl + 4 &&
++			    !strncasecmp(a->m[i].name, g, bl) && !strcasecmp(extof(a->m[i].name), image_of[k][1])) {
++				a->game = i;
++				break;
++			}
++		break;
++	}
+ }
+ 
+ struct arc *arc_open(const char *path, char *err, int errlen)
+diff --git a/frontend/riscos/host.c b/frontend/riscos/host.c
+index 9ff97626..591a1e88 100644
+--- a/frontend/riscos/host.c
++++ b/frontend/riscos/host.c
+@@ -654,6 +654,11 @@ void host_shutdown(void)
+ 	nopts = 0;
+ }
+ 
++/* libpcsxcore/cdrom-async.c: closes the disc image's files. The core's
++   retro_unload_game does nothing, so without this the image stays open
++   (and on RISC OS an open file can't be deleted, e.g. an unpacked game). */
++void cdra_close(void);
++
+ int host_load_game(const char *path)
+ {
+ 	return host_load_game_as(path, path);
+@@ -671,6 +676,7 @@ int host_load_game_as(const char *path, const char *name_from)
+ 	plat_log("Loading %s\n", path);
+ 	if (!retro_load_game(&info)) {
+ 		plat_log("The core couldn't load %s\n", path);
++		cdra_close();
+ 		game_name[0] = 0;
+ 		return 0;
+ 	}
+@@ -705,6 +711,7 @@ void host_unload_game(void)
+ 		return;
+ 	host_flush_saves();
+ 	retro_unload_game();
++	cdra_close();
+ 	game_loaded = 0;
+ 	game_name[0] = 0;
+ 	frame.buf = NULL;
+diff --git a/frontend/riscos/wimp.c b/frontend/riscos/wimp.c
+index 4e98ea1d..6dc7ffbc 100644
+--- a/frontend/riscos/wimp.c
++++ b/frontend/riscos/wimp.c
+@@ -33,6 +33,7 @@
+ #include "rofe.h"
+ #include "ui.h"
+ #include "archive.h"
++#include <dirent.h>
+ 
+ /* The heap goes in a dynamic area named after us, up to 256 MB (it only
+    grows that far unpacking a 7z made with a big dictionary). */
+@@ -581,6 +582,7 @@ static void load_file(const char *unix_path, const char *name_from)
+ #define UNPACK_DIR "/<Wimp$ScrapDir>/PCSXGame"
+ static char unpack_from[1024];      /* the archive unpacked (or being unpacked) */
+ static char unpacked_game[1100];    /* its game file, once unpacked */
++static char unpack_dir[600];        /* where (UNPACK_DIR/n) */
+ static unsigned t_unpack0;
+ 
+ /* Deletes what was unpacked (the game must be unloaded first: RISC OS
+@@ -591,7 +593,7 @@ static void clear_unpacked(void)
+ 		arc_close(unpacking);
+ 		unpacking = NULL;
+ 	}
+-	arc_clear_dir(UNPACK_DIR);
++	arc_clear_dir(UNPACK_DIR);         /* and the numbered folders in it */
+ 	unpack_from[0] = unpacked_game[0] = 0;
+ 	unpack_pct = -1;
+ }
+@@ -653,7 +655,28 @@ static void unpack_game(const char *path)
+ 		archive_failed(path, err);
+ 		return;
+ 	}
+-	if (!arc_unpack_start(a, UNPACK_DIR, err, sizeof err)) {
++	/* into PCSXGame.1, or the next whose old files could be deleted
++	   (nothing should still be open, but if something is, carry on) */
++	{
++		int n;
++		for (n = 1; n < 10; n++) {
++			DIR *d;
++			struct dirent *e;
++			int empty = 1;
++			snprintf(unpack_dir, sizeof unpack_dir, "%s/%d", UNPACK_DIR, n);
++			arc_clear_dir(unpack_dir);
++			if ((d = opendir(unpack_dir)) != NULL) {
++				while ((e = readdir(d)) != NULL)
++					if (strcmp(e->d_name, ".") && strcmp(e->d_name, ".."))
++						empty = 0;
++				closedir(d);
++			}
++			if (empty)
++				break;
++			plat_log("%s couldn't be emptied (a file still open?)\n", unpack_dir);
++		}
++	}
++	if (!arc_unpack_start(a, unpack_dir, err, sizeof err)) {
+ 		arc_close(a);
+ 		archive_failed(path, err);
+ 		return;
+-- 
+2.43.0
+

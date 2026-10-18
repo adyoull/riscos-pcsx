@@ -34,6 +34,12 @@ with zipfile.ZipFile(f'{o}/zip64.zip','w',zipfile.ZIP_DEFLATED) as z:
     for f in files:
         with open(f,'rb') as i, z.open(f,'w',force_zip64=True) as w: w.write(i.read())
 with zipfile.ZipFile(f'{o}/nogame.zip','w') as z: z.write('readme.txt')
+# a CloneCD rip, named like a real one
+c='Tomba! [U] [SCUS-94236]'
+with zipfile.ZipFile(f'{o}/clonecd.zip','w',zipfile.ZIP_DEFLATED) as z:
+    z.writestr(c+'.ccd','[CloneCD]\nVersion=3\n')
+    z.write('Game One & Two (Europe).bin', c+'.img')
+    z.writestr(c+'.sub',bytes(96*100))
 with zipfile.ZipFile(f'{o}/multi.zip','w',zipfile.ZIP_DEFLATED) as z:
     z.writestr('Disc 2.cue','FILE "Disc 2.bin" BINARY\n'); z.writestr('Disc 2.bin',b'2'*5000)
     z.writestr('Disc 1.cue','FILE "Disc 1.bin" BINARY\n'); z.writestr('Disc 1.bin',b'1'*5000)

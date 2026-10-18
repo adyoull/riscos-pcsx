@@ -157,6 +157,19 @@ int main(int argc, char **argv)
 	CHECK(a && arc_game(a) == NULL, "no game in it");
 	arc_close(a);
 
+	cur = "clonecd.zip";
+	r = unpack("clonecd.zip", err, &steps, &a);
+	CHECK(r == 0 && arc_game(a) && !strcmp(arc_game(a), "Tomba! [U] [SCUS-94236].img"),
+	      "a CloneCD rip: the core is given the .img (it finds the .ccd and .sub)");
+	snprintf(p, sizeof p, "%s/out/Tomba! [U] [SCUS-94236].ccd", T);
+	{ FILE *f = fopen(p, "r"); CHECK(f != NULL, "the .ccd beside it"); if (f) fclose(f); }
+	arc_close(a);
+	{
+		char s[16];
+		snprintf(p, sizeof p, "%s/arc/clonecd.zip", T);
+		CHECK(library_read_serial(p, s, sizeof s) && !strcmp(s, "SLES12345"), "its serial, from the .img");
+	}
+
 	cur = "multi.zip";
 	r = unpack("multi.zip", err, &steps, &a);
 	CHECK(r == 0 && arc_game(a) && !strcmp(arc_game(a), "Game.m3u"), "the .m3u is the game");

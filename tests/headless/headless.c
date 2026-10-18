@@ -16,8 +16,12 @@
  *   stick=FRAME:X,Y:LEN   joystick left stick (-32767..32767)
  *   shot=FRAME:FILE.ppm   also write the picture after FRAME frames
  *   savestate=FRAME:SLOT, loadstate=FRAME:SLOT
- * Prints: frames, picture size and checksum, sound statistics, and each
- * frame's pad bits when padlog=1.
+ * GAME may be a .zip or .7z: it's unpacked (archive.c) into TEST_DIR/unpack
+ * first, as the desktop does.
+ * Prints: frames, picture size and checksum, sound statistics, each
+ * frame's pad bits when padlog=1, and how many files in the game's folder
+ * are still open after it's unloaded (none should be: on RISC OS an open
+ * file can't be deleted).
  *
  * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
  */
@@ -28,6 +32,31 @@
 #include <math.h>
 #include <signal.h>
 #include <ucontext.h>
+#include <dirent.h>
+#include <unistd.h>
+#include "archive.h"
+
+/* files open in DIR (from /proc/self/fd) */
+static int open_in(const char *dir)
+{
+	DIR *d = opendir("/proc/self/fd");
+	struct dirent *e;
+	int n = 0;
+	char p[300], t[1100];
+	if (d == NULL)
+		return -1;
+	while ((e = readdir(d)) != NULL) {
+		ssize_t l;
+		snprintf(p, sizeof p, "/proc/self/fd/%s", e->d_name);
+		if ((l = readlink(p, t, sizeof t - 1)) <= 0)
+			continue;
+		t[l] = 0;
+		if (!strncmp(t, dir, strlen(dir)) && t[strlen(dir)] == '/')
+			n++;
+	}
+	closedir(d);
+	return n;
+}
 #include <unistd.h>
 #include "rofe.h"
 
@@ -212,6 +241,8 @@ static void fault(int sig, siginfo_t *si, void *uc_)
 	_exit(128 + sig);
 }
 
+static char unload_dir[1100];
+
 int main(int argc, char **argv)
 {
 	{
@@ -254,9 +285,32 @@ int main(int argc, char **argv)
 	snprintf(save, sizeof save, "%s/saves", dir);
 	snprintf(state, sizeof state, "%s/states", dir);
 	host_init(sys, save, state, fb);
-	if (!host_load_game(argv[1])) {
-		fprintf(stderr, "test: load failed\n");
-		return 1;
+	{
+		char game[1100], gdir[1100], err[300];
+		snprintf(game, sizeof game, "%s", argv[1]);
+		if (arc_type(argv[1])) {
+			struct arc *a = arc_open(argv[1], err, sizeof err);
+			int r = -1;
+			snprintf(gdir, sizeof gdir, "%s/unpack", dir);
+			arc_clear_dir(gdir);
+			if (a && arc_game(a) && arc_unpack_start(a, gdir, err, sizeof err))
+				while ((r = arc_unpack_step(a, err, sizeof err)) > 0)
+					;
+			if (r != 0) {
+				fprintf(stderr, "test: unpacking failed: %s\n", err);
+				return 1;
+			}
+			snprintf(game, sizeof game, "%s", arc_game_path(a));
+			printf("unpacked: %s\n", strrchr(game, '/') + 1);
+			arc_close(a);
+		}
+		snprintf(gdir, sizeof gdir, "%s", game);
+		*strrchr(gdir, '/') = 0;
+		if (!host_load_game_as(game, argv[1])) {
+			printf("load failed; files open: %d\n", open_in(gdir));
+			return 1;
+		}
+		strcpy(unload_dir, gdir);
 	}
 	for (frame_no = 0; frame_no < frames; frame_no++) {
 		int k;
@@ -302,6 +356,8 @@ int main(int argc, char **argv)
 		       n ? sqrt(audio_sumsq_l / n) : 0.0, n ? sqrt(audio_sumsq_r / n) : 0.0);
 	}
 	host_flush_saves();
+	host_unload_game();
+	printf("files open after unloading: %d\n", open_in(unload_dir));
 	host_shutdown();
 	printf("done\n");
 	return 0;
