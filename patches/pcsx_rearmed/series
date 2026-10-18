@@ -1,0 +1,5 @@
+0001-RISC-OS-static-libretro-core-Makefile.libretro-platf.patch
+0002-No-unaligned-word-loads-stores-where-they-fault.patch
+0003-RISC-OS-32bpp-frames-as-RISC-OS-sprite-images-TBGR.patch
+0004-RISC-OS-.cue-files-naming-files-with-spaces.patch
+0005-RISC-OS-native-desktop-frontend.patch

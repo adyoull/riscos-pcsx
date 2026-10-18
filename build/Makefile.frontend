@@ -1,0 +1,15 @@
+# Builds !RunImage: the native frontend + the core archive.
+# make -f Makefile.frontend SRC=<pcsx_rearmed tree> OUT=<dir> CORE=<core .a>
+CC = arm-riscos-gnueabihf-gcc
+CFLAGS = -DROFE_VERSION=\"$(VERSION)\" -O2 -marm -mtune=cortex-a72 -mfpu=neon -mfloat-abi=hard \
+	-fstack-clash-protection -Wall -Wno-unused-function \
+	-I$(SRC)/deps/libretro-common/include -I$(SRC)/frontend/riscos
+FE = host choices keys plat_riscos wimp
+OBJS = $(FE:%=$(OUT)/fe_%.o)
+
+$(OUT)/pcsx.elf: $(OBJS) $(CORE)
+	$(CC) $(CFLAGS) -static -o $@ $(OBJS) $(CORE) -lm
+
+$(OUT)/fe_%.o: $(SRC)/frontend/riscos/%.c $(SRC)/frontend/riscos/rofe.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -c -o $@ $<

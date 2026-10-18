@@ -1,0 +1,119 @@
+!PCSX - PCSX ReARMed for RISC OS                    @VERSION@
+================================
+
+PCSX ReARMed is a Sony PlayStation emulator, written for ARM machines.
+This is its libretro core with a native RISC OS desktop frontend: a
+window you can drag disc images onto, full screen, sound through
+SharedSound, the keyboard and USB game pads.
+
+This is a TEST BUILD: it writes a log to <Wimp$ScrapDir>.pcsxlog (the
+icon bar menu's "Log..." opens it). Please include it when reporting a
+problem.
+
+
+Requirements
+------------
+- RISC OS 5 on an ARMv7 machine with NEON (Raspberry Pi 2, 3, 4, 400,
+  500; most Cortex-A8/A9 boards). Written for and best on a Pi 4.
+- SharedUnixLibrary 1.16+ and ARMEABISupport (PackMan installs both).
+- For sound: SharedSoundBuffer and StreamManager (ssb.zip from
+  https://orac.co.uk/software/rdpclient/rdpclient.html). Without them,
+  games run silently.
+- For game pads: !USBJoystick (USBJoystick 0.23 or later), run before
+  PCSX or from your boot sequence.
+
+
+Playing
+-------
+Double-click !PCSX, then drag a disc image onto the icon bar icon or the
+window. PCSX reads:
+  .cue with .bin    (the usual rip of a CD; keep them together)
+  .chd              (compressed, from MAME's chdman)
+  .pbp              (PSP "eboot" images)
+  .iso, .img
+  .m3u              (a list of discs for multi-disc games)
+  .exe              (PlayStation programs, e.g. homebrew)
+
+A file with a space in its name is shown by RISC OS with a hard space;
+.cue files that name such files are understood.
+
+Click in the window so it has the input focus (the keyboard is only read
+then). Menu over the window: Pause, Reset, Full screen, Scale, save
+states and slots, Close game, Quit.
+
+Keys (change them in Choices):
+  Cursor keys     D-pad
+  Z  X  A  S      Cross  Circle  Square  Triangle
+  Q  W  1  2      L1  R1  L2  R2      3  4   L3  R3
+  Return          Start              Right Shift   Select
+
+  F2 / F4         save / load the state in the current slot
+  F6 / F7         previous / next slot (0-9)
+  F8              pause
+  F11, Alt-Return full screen on and off; Escape leaves full screen
+  F12             (as always: the command line)
+
+Full screen is a window covering the screen, so the desktop keeps
+running underneath; the menu still works there.
+
+
+BIOS
+----
+PCSX has a built-in replacement for the PlayStation BIOS (HLE), which
+runs most games. A real BIOS image works better with some games and
+shows the boot screen; if you have one from your own console, put it in
+<Choices$Write>.PCSX.bios (e.g. scph1001/bin or scph5501/bin). It is
+used automatically.
+
+
+Memory cards and save states
+----------------------------
+Memory card 1 is <Choices$Write>.PCSX.saves.pcsx-card1/mcd, shared by
+all games, as on a real console; card 2 is pcsx-card2/mcd (other choices
+in Choices). Save states go in <Choices$Write>.PCSX.states.<game>.
+
+
+Game pads
+---------
+With !USBJoystick running, the first two pads are players 1 and 2. A hat
+switch or D-pad is the PlayStation D-pad. Analogue sticks reach the game
+if you set pad1.type to analog or dualshock in Choices. Pads differ in
+how they number their buttons: set joy.log to 1, press each button, and
+read the numbers in the log; then set joy.buttons to match.
+
+
+Choices
+-------
+The icon bar menu's "Choices..." opens <Choices$Write>.PCSX.Choices.
+!PCSX.Resources.Choices lists every setting and what it does; copy the
+lines you want to change into your Choices and choose "Reload choices".
+Window scale, sound latency, keys, pad types, joystick buttons, and the
+emulator's own options (dynamic recompiler on or off, BIOS, region,
+frame skipping, high resolution rendering, ...) are all there.
+
+
+Speed
+-----
+The dynamic recompiler and the NEON renderer are what make it fast. The
+title bar shows the frame rate (test builds). If a game is too slow, try
+pcsx_rearmed_frameskip_type: auto. If a game misbehaves, try
+pcsx_rearmed_drc: disabled (much slower) to see if the recompiler is to
+blame.
+
+
+Licence and sources
+-------------------
+PCSX ReARMed is free software under the GNU General Public Licence
+version 2 or later (see docs.COPYING), by the PCSX, PCSX-df, PCSX-r
+and PCSX ReARMed developers (notaz, Exophase, and many others; see
+docs.AUTHORS). It includes libchdr (BSD), miniz (MIT), LZMA SDK (public
+domain), zstd (BSD) and libretro-common (MIT) (see docs.Licences).
+
+The RISC OS port (the native frontend, the changes in docs.Patches) is by
+Andrew Youll, also under the GPL version 2 or later. AI (Anthropic's
+Claude) has been used as a coding assistant on this port. Source:
+docs.Source says where to get it.
+
+PlayStation is a trademark of Sony Interactive Entertainment; this
+program has nothing to do with Sony. Use only discs and BIOS images you
+own.

@@ -1,0 +1,14 @@
+# Changelog
+
+## r26-riscos1test (2026-10-18)
+First test build.
+- PCSX ReARMed master 8b6c1635 (r26-89) as a static libretro core for RISC OS:
+  ari64 dynarec (translation cache in .bss), NEON GPU, no threads.
+- RISC OS alignment rules: NEON assembler rewritten at build time
+  (riscos-crossdev neon-align.py); dynarec get_reg and a gpu_neon word store
+  fixed (patch 0002).
+- Native frontend: Wimp window and full screen, sprite plotting, SSB sound
+  (paced by the sound), keyboard, USBJoystick pads (2 players), save states
+  (F2/F4, slots F6/F7), pause F8, full screen F11/Alt-Return, Choices file,
+  drag and drop of .cue/.bin, .chd, .pbp, .iso, .m3u, .exe.
+- .cue files naming files with spaces find them as hard spaces (patch 0004).

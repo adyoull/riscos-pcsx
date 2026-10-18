@@ -1,0 +1,53 @@
+| !Run for !PCSX - PCSX ReARMed, the PlayStation emulator, for RISC OS.
+| Built with GCCSDK GCC 10.2 (arm-riscos-gnueabihf), statically linked
+| and converted to an Absolute (AIF) file, so !SharedLibs isn't needed.
+| The desktop frontend is native: no SDL.
+
+Set PCSX$Dir <Obey$Dir>
+IconSprites <PCSX$Dir>.!Sprites
+
+RMEnsure UtilityModule 5.00 Error PCSX needs RISC OS 5.
+
+| --- C library ------------------------------------------------------
+RMEnsure SharedUnixLibrary 1.16 IfThere System:Modules.SharedULib Then RMLoad System:Modules.SharedULib
+RMEnsure SharedUnixLibrary 1.16 Error PCSX needs SharedUnixLibrary 1.16 or later. Install it with PackMan.
+RMEnsure ARMEABISupport 0 IfThere System:Modules.ARMEABISupport Then RMLoad System:Modules.ARMEABISupport
+RMEnsure ARMEABISupport 0 Error PCSX needs the ARMEABISupport module. Install it with PackMan.
+
+| --- Sound ------------------------------------------------------------
+| Sound goes through SharedSoundBuffer, StreamManager and SharedSound
+| (in !System), mixed with other programs' sound. SharedSound is part of
+| RISC OS; SharedSoundBuffer and StreamManager are in ssb.zip from
+| https://orac.co.uk/software/rdpclient/rdpclient.html. Without them
+| games run silently (paced by the clock instead of the sound).
+RMEnsure SharedSound 1.07 IfThere System:Modules.SSound Then RMLoad System:Modules.SSound
+RMEnsure StreamManager 0.03 IfThere System:Modules.StreamMan Then RMLoad System:Modules.StreamMan
+RMEnsure SharedSoundBuffer 0.07 IfThere System:Modules.SSBuffer Then RMLoad System:Modules.SSBuffer
+
+| --- Joysticks --------------------------------------------------------
+| USB game pads work through !USBJoystick (Richard Walker's USBJoystick
+| module, 0.23 or later): run it before PCSX, or put it in your boot
+| sequence. Pads plugged in later are found within a second.
+
+| --- Your files -------------------------------------------------------
+| BIOS images (optional), memory cards and save states live in
+| <Choices$Write>.PCSX: bios, saves, states. Choices is a text file of
+| settings (the icon bar menu's Choices... opens it).
+IfThere <Choices$Write>.PCSX Then Else CDir <Choices$Write>.PCSX
+IfThere <Choices$Write>.PCSX.bios Then Else CDir <Choices$Write>.PCSX.bios
+IfThere <Choices$Write>.PCSX.Choices Then Else Copy <PCSX$Dir>.Resources.UserChoices <Choices$Write>.PCSX.Choices ~C~V
+
+| --- Logging ----------------------------------------------------------
+| For a log in <Wimp$ScrapDir>.pcsxlog (useful when reporting a
+| problem), keep the next line; put a | in front of it for no log.
+Set PCSX$LogOn 1
+Unset PCSX$Log
+If "<PCSX$LogOn>"<>"" Then Set PCSX$Log /|<Wimp$ScrapDir>/pcsxlog
+Unset PCSX$LogOn
+
+| --- Memory -----------------------------------------------------------
+| The program and the dynamic recompiler's 16 MB code cache are in the
+| WimpSlot; the C heap goes in a dynamic area ("PCSX Heap").
+WimpSlot -min 28000K -max 28000K
+
+Run <PCSX$Dir>.!RunImage %*0

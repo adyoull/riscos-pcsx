@@ -1,0 +1,155 @@
+From 0a51e35f985837ca333722351ea15e918348493b Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:00:00 +0100
+Subject: [PATCH 1/5] RISC OS: static libretro core (Makefile.libretro
+ platform=riscos)
+
+GCCSDK arm-riscos-gnueabihf, UnixLib, single core: ari64 dynarec in
+.bss, no threads, no mmap (calloc), no physical CD, NEON GPU. CROSS=
+builds the same core for ARM Linux tests. strcasestr for UnixLib.
+NEON assembler goes through tools/neon-riscos.sh, which rewrites
+accesses that could be unaligned (RISC OS faults on them) with
+riscos-crossdev's neon-align.py.
+---
+ Makefile.libretro                    | 44 ++++++++++++++++++++++++++++
+ frontend/riscos/riscos_compat.c      | 15 ++++++++++
+ frontend/riscos/riscos_compat.h      | 15 ++++++++++
+ frontend/riscos/tools/neon-riscos.sh | 23 +++++++++++++++
+ 4 files changed, 97 insertions(+)
+ create mode 100644 frontend/riscos/riscos_compat.c
+ create mode 100644 frontend/riscos/riscos_compat.h
+ create mode 100755 frontend/riscos/tools/neon-riscos.sh
+
+diff --git a/Makefile.libretro b/Makefile.libretro
+index cd53109e..13a71003 100644
+--- a/Makefile.libretro
++++ b/Makefile.libretro
+@@ -587,6 +587,38 @@ else ifneq (,$(findstring armv,$(platform)))
+ 	ARCH = arm
+ 	DYNAREC = ari64
+ 
++# RISC OS 5 (GCCSDK arm-riscos-gnueabihf, UnixLib), static archive for the
++# native Wimp frontend in frontend/riscos. Single core: no threads.
++else ifeq ($(platform), riscos)
++	TARGET := $(TARGET_NAME)_libretro_riscos.a
++	# CROSS=arm-linux-gnueabihf- builds the same core for the Linux tests
++	CROSS ?= arm-riscos-gnueabihf-
++	CC = $(CROSS)gcc
++	CXX = $(CROSS)g++
++	AR = $(CROSS)ar
++	CFLAGS += -mno-unaligned-access -DROFE_TBGR
++	CFLAGS += -marm -mtune=cortex-a72 -mfpu=neon -mfloat-abi=hard
++	CFLAGS += -fstack-clash-protection -DNO_DYLIB -DNO_SOCKET
++	CFLAGS += -include frontend/riscos/riscos_compat.h
++	OBJS += frontend/riscos/riscos_compat.o frontend/riscos/cspace_riscos.o
++	ASFLAGS += -mfpu=neon -mfloat-abi=hard
++	CFLAGS_OPT = -O2
++	HAVE_NEON_ASM = 1
++	BUILTIN_GPU = neon
++	DYNAREC := $(if $(RISCOS_DYNAREC),$(RISCOS_DYNAREC),ari64)
++	ARCH = arm
++	STATIC_LINKING = 1
++	NO_MMAP := 1 # psxmem: calloc; ndrc stays in .bss
++	NDRC_THREAD := 0
++	USE_ASYNC_CDROM := 0
++	USE_ASYNC_GPU := 0
++	USE_ASYNC_SPU := 0
++	USE_RTHREADS := 0
++	HAVE_PHYSICAL_CDROM = 0
++	USE_LIBRETRO_VFS = 0
++	LIBPTHREAD :=
++	LIBDL :=
++
+ else ifeq ($(platform), miyoo)
+ 	TARGET := $(TARGET_NAME)_libretro.so
+ 	fpic := -fPIC
+@@ -700,3 +732,15 @@ include Makefile
+ # no special AS needed for gpu_neon
+ plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.o: plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.S
+ 	$(CC) $(CFLAGS) -c $^ -o $@
++
++ifeq ($(platform), riscos)
++# RISC OS faults on NEON accesses not aligned to their element size: the
++# NEON assembler goes through frontend/riscos/tools/neon-riscos.sh, which
++# needs riscos-crossdev's checks/neon-align.py (NEON_ALIGN).
++NEON_ALIGN ?= $(error NEON_ALIGN: set it to riscos-crossdev/checks/neon-align.py)
++NEON_RISCOS = frontend/riscos/tools/neon-riscos.sh
++plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.o: plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.S $(NEON_RISCOS)
++	$(NEON_RISCOS) $(NEON_ALIGN) $< $@ $(CC) $(CFLAGS)
++frontend/cspace_neon.o libpcsxcore/gte_neon.o libpcsxcore/gte_nf_neon.o: %.o: %.S $(NEON_RISCOS)
++	$(NEON_RISCOS) $(NEON_ALIGN) $< $@ $(CC) $(CFLAGS)
++endif
+diff --git a/frontend/riscos/riscos_compat.c b/frontend/riscos/riscos_compat.c
+new file mode 100644
+index 00000000..a3adbda3
+--- /dev/null
++++ b/frontend/riscos/riscos_compat.c
+@@ -0,0 +1,15 @@
++/* What UnixLib lacks, for the RISC OS build. */
++#include <ctype.h>
++#include <string.h>
++#include "riscos_compat.h"
++
++char *riscos_strcasestr(const char *h, const char *n)
++{
++	size_t len = strlen(n);
++	if (len == 0)
++		return (char *)h;
++	for (; *h; h++)
++		if (strncasecmp(h, n, len) == 0)
++			return (char *)h;
++	return NULL;
++}
+diff --git a/frontend/riscos/riscos_compat.h b/frontend/riscos/riscos_compat.h
+new file mode 100644
+index 00000000..b4d2373c
+--- /dev/null
++++ b/frontend/riscos/riscos_compat.h
+@@ -0,0 +1,15 @@
++/* Forced include for the RISC OS build (-include): what UnixLib lacks. */
++#ifndef RISCOS_COMPAT_H
++#define RISCOS_COMPAT_H
++#if defined(__riscos__) && !defined(__ASSEMBLER__)
++#include <stddef.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++char *riscos_strcasestr(const char *haystack, const char *needle);
++#define strcasestr riscos_strcasestr
++#ifdef __cplusplus
++}
++#endif
++#endif
++#endif
+diff --git a/frontend/riscos/tools/neon-riscos.sh b/frontend/riscos/tools/neon-riscos.sh
+new file mode 100755
+index 00000000..b5038ecd
+--- /dev/null
++++ b/frontend/riscos/tools/neon-riscos.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++# Assembles NEON source for RISC OS, where loads and stores must be aligned
++# to their element size:
++#   neon-riscos.sh NEON_ALIGN IN.S OUT.o CC CFLAGS...
++# 1. preprocesses IN.S (the gpu_neon source builds instructions from C
++#    macros, with #defined register names, one macro per line);
++# 2. one instruction per line, and .u8/.u16/.u32/.u64 written as .8 etc.;
++# 3. riscos-crossdev's checks/neon-align.py rewrites every NEON access that
++#    could be unaligned into one that can't fault (byte-sized elements);
++#    vld2-4/vst2-4 of 16-bit elements are left alone (they need 2-byte
++#    alignment, which 16-bit pixel and texel pointers have) and listed;
++# 4. assembles the result.
++set -euo pipefail
++NA=$1; IN=$2; OUT=$3; CC=$4; shift 4
++TMP=${OUT%.o}.riscos
++"$CC" "$@" -E -P -x assembler-with-cpp "$IN" -o "$TMP.i"
++sed -e 's/;/\n/g' -e 's/\b\(v\(ld\|st\)[1-4]\)\.u\(8\|16\|32\|64\)\b/\1.\3/g' "$TMP.i" > "$TMP.s"
++allow=()
++while IFS= read -r line; do
++  allow+=(--allow "$line")
++done < <(python3 "$NA" --check "$TMP.s" 2>&1 | grep -E '^[^ ]+:[0-9]+: v(ld|st)[234]\.16 ' | cut -d: -f1,2 || true)
++python3 "$NA" "${allow[@]}" "$TMP.s" >"$TMP.log"
++"$CC" "$@" -c -x assembler "$TMP.s" -o "$OUT"
+-- 
+2.43.0
+

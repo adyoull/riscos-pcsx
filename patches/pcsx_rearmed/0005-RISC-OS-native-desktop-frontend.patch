@@ -1,0 +1,2464 @@
+From 43efa49211197792611c08761a8f8d3eba4ee959 Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:00:00 +0100
+Subject: [PATCH 5/5] RISC OS: native desktop frontend
+
+A Wimp task (no SDL): icon bar, game window, full screen window,
+menus, drag and drop of disc images, frames plotted from a 32bpp
+sprite the core draws into, sound through SharedSoundBuffer and
+StreamManager (paced by the sound), keyboard by OS_Byte 121 scans,
+USB game pads through USBJoystick's API, save states, Choices.
+---
+ frontend/riscos/choices.c     |  93 ++++
+ frontend/riscos/host.c        | 825 ++++++++++++++++++++++++++++++++
+ frontend/riscos/keys.c        |  60 +++
+ frontend/riscos/plat_riscos.c | 453 ++++++++++++++++++
+ frontend/riscos/rofe.h        |  97 ++++
+ frontend/riscos/wimp.c        | 872 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 2400 insertions(+)
+ create mode 100644 frontend/riscos/choices.c
+ create mode 100644 frontend/riscos/host.c
+ create mode 100644 frontend/riscos/keys.c
+ create mode 100644 frontend/riscos/plat_riscos.c
+ create mode 100644 frontend/riscos/rofe.h
+ create mode 100644 frontend/riscos/wimp.c
+
+diff --git a/frontend/riscos/choices.c b/frontend/riscos/choices.c
+new file mode 100644
+index 00000000..0408ab79
+--- /dev/null
++++ b/frontend/riscos/choices.c
+@@ -0,0 +1,93 @@
++/*
++ * The Choices file: one setting per line, "key: value" (or "key = value").
++ * Blank lines and lines starting with # are ignored. Later lines win.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include "rofe.h"
++
++#define MAX_CHOICES 256
++
++static struct { char key[64]; char value[128]; } ch[MAX_CHOICES];
++static int nch;
++
++void choices_clear(void)
++{
++	nch = 0;
++}
++
++static char *trim(char *s)
++{
++	char *e;
++	while (*s && isspace((unsigned char)*s))
++		s++;
++	e = s + strlen(s);
++	while (e > s && isspace((unsigned char)e[-1]))
++		*--e = 0;
++	return s;
++}
++
++void choices_set(const char *key, const char *value)
++{
++	int i;
++	for (i = 0; i < nch; i++)
++		if (strcasecmp(ch[i].key, key) == 0)
++			break;
++	if (i == nch) {
++		if (nch == MAX_CHOICES)
++			return;
++		nch++;
++	}
++	snprintf(ch[i].key, sizeof ch[i].key, "%s", key);
++	snprintf(ch[i].value, sizeof ch[i].value, "%s", value);
++}
++
++int choices_load(const char *path)
++{
++	char line[256];
++	FILE *f = fopen(path, "r");
++	if (f == NULL)
++		return 0;
++	while (fgets(line, sizeof line, f)) {
++		char *s = trim(line), *sep;
++		if (*s == 0 || *s == '#')
++			continue;
++		sep = strpbrk(s, ":=");
++		if (sep == NULL)
++			continue;
++		*sep = 0;
++		choices_set(trim(s), trim(sep + 1));
++	}
++	fclose(f);
++	return 1;
++}
++
++const char *choices_get(const char *key)
++{
++	int i;
++	for (i = nch - 1; i >= 0; i--)
++		if (strcasecmp(ch[i].key, key) == 0)
++			return ch[i].value;
++	return NULL;
++}
++
++int choices_get_int(const char *key, int def)
++{
++	const char *v = choices_get(key);
++	char *end;
++	long n;
++	if (v == NULL || *v == 0)
++		return def;
++	if (strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0 ||
++	    strcasecmp(v, "enabled") == 0 || strcasecmp(v, "true") == 0)
++		return 1;
++	if (strcasecmp(v, "no") == 0 || strcasecmp(v, "off") == 0 ||
++	    strcasecmp(v, "disabled") == 0 || strcasecmp(v, "false") == 0)
++		return 0;
++	n = strtol(v, &end, 0);
++	return end == v ? def : (int)n;
++}
+diff --git a/frontend/riscos/host.c b/frontend/riscos/host.c
+new file mode 100644
+index 00000000..f5b45ea9
+--- /dev/null
++++ b/frontend/riscos/host.c
+@@ -0,0 +1,825 @@
++/*
++ * The libretro host for !PCSX: everything between the core
++ * (frontend/libretro.c) and the desktop (wimp.c).
++ *
++ * - Core options: the core declares them (RETRO_ENVIRONMENT_SET_VARIABLES,
++ *   "Description; default|other|..."). The value used is the Choices
++ *   file's, if it names a value the option has, else this frontend's
++ *   default (fe_defaults below), else the core's.
++ * - Video: the core draws straight into the frontend's buffer (the image
++ *   of a RISC OS 32bpp sprite) through GET_CURRENT_SOFTWARE_FRAMEBUFFER.
++ * - Sound: each frame's samples are queued with plat_audio_write.
++ * - Input: keyboard (only while we have the input focus) and joysticks,
++ *   both mapped by Choices.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <stdarg.h>
++#include <errno.h>
++#include <sys/stat.h>
++#include "libretro.h"
++#include "rofe.h"
++
++/* ------------------------------------------------------------------ */
++/* Core options                                                        */
++
++#define MAX_OPTS 160
++
++struct opt {
++	char key[64];
++	char *values;            /* "a|b|c", malloc'ed */
++	char value[64];          /* the one in use */
++};
++static struct opt opts[MAX_OPTS];
++static int nopts;
++static int opts_changed;
++
++/* This frontend's defaults, where the core's don't suit RISC OS. */
++static const char *const fe_defaults[][2] = {
++	{ "pcsx_rearmed_rgb32_output", "enabled" },   /* required: 32bpp sprite */
++	{ "pcsx_rearmed_memcard1", "shared" },        /* one card for all games */
++	{ "pcsx_rearmed_drc", "enabled" },
++	{ "pcsx_rearmed_frameskip_type", "disabled" },
++	{ NULL, NULL }
++};
++/* Options the frontend depends on: Choices can't change them. */
++static const char *const fe_forced[][2] = {
++	{ "pcsx_rearmed_rgb32_output", "enabled" },
++	{ "pcsx_rearmed_scale_hires", "disabled" },
++	{ "pcsx_rearmed_drc_thread", "disabled" },
++	{ "pcsx_rearmed_spu_thread", "disabled" },
++	{ "pcsx_rearmed_gpu_thread_rendering", "disabled" },
++	{ NULL, NULL }
++};
++
++static int value_allowed(const struct opt *o, const char *v)
++{
++	const char *p = o->values;
++	size_t n = strlen(v);
++	if (n == 0)
++		return 0;
++	while (p && *p) {
++		const char *e = strchr(p, '|');
++		size_t len = e ? (size_t)(e - p) : strlen(p);
++		if (len == n && strncasecmp(p, v, n) == 0)
++			return 1;
++		p = e ? e + 1 : NULL;
++	}
++	return 0;
++}
++
++static const char *table_get(const char *const t[][2], const char *key)
++{
++	int i;
++	for (i = 0; t[i][0]; i++)
++		if (strcmp(t[i][0], key) == 0)
++			return t[i][1];
++	return NULL;
++}
++
++/* Work out every option's value; note whether any changed. */
++static void opts_resolve(void)
++{
++	int i;
++	for (i = 0; i < nopts; i++) {
++		struct opt *o = &opts[i];
++		const char *v = table_get(fe_forced, o->key);
++		char old[64];
++		strcpy(old, o->value);
++		if (v == NULL || !value_allowed(o, v)) {
++			v = choices_get(o->key);
++			if (v && !value_allowed(o, v)) {
++				plat_log("Choices: %s: \"%s\" isn't one of %s\n", o->key, v, o->values);
++				v = NULL;
++			}
++		}
++		if (v == NULL) {
++			v = table_get(fe_defaults, o->key);
++			if (v && !value_allowed(o, v))
++				v = NULL;
++		}
++		if (v == NULL) {           /* the core's default: the first value */
++			const char *e = strchr(o->values, '|');
++			size_t len = e ? (size_t)(e - o->values) : strlen(o->values);
++			if (len >= sizeof o->value)
++				len = sizeof o->value - 1;
++			memcpy(o->value, o->values, len);
++			o->value[len] = 0;
++		} else
++			snprintf(o->value, sizeof o->value, "%s", v);
++		if (strcmp(old, o->value) != 0)
++			opts_changed = 1;
++	}
++}
++
++static void opts_set_variables(const struct retro_variable *vars)
++{
++	for (; vars->key && nopts < MAX_OPTS; vars++) {
++		const char *semi = strchr(vars->value, ';');
++		struct opt *o = &opts[nopts];
++		const char *list = semi ? semi + 1 : vars->value;
++		while (*list == ' ')
++			list++;
++		snprintf(o->key, sizeof o->key, "%s", vars->key);
++		o->values = strdup(list);
++		o->value[0] = 0;
++		if (o->values)
++			nopts++;
++	}
++	opts_resolve();
++	opts_changed = 0;
++}
++
++static const char *opt_get(const char *key)
++{
++	int i;
++	for (i = 0; i < nopts; i++)
++		if (strcmp(opts[i].key, key) == 0)
++			return opts[i].value;
++	return NULL;
++}
++
++/* ------------------------------------------------------------------ */
++/* State                                                               */
++
++static char sys_dir[512], save_dir[512], state_dir[512];
++static host_fb_func fb_func;
++static int game_loaded;
++static char game_name[128];
++static struct retro_system_av_info av;
++static struct host_video frame;
++static int new_frame;
++static char message[128];
++static unsigned message_until;
++
++static int16_t audio_buf[44100 / 25 * 2 * 2];   /* > one frame of stereo */
++static int audio_frames;
++static int audio_open;
++
++/* Input */
++#define NBUTTONS 16
++static const char *const button_names[NBUTTONS] = {
++	"cross", "square", "select", "start", "up", "down", "left", "right",
++	"circle", "triangle", "l1", "r1", "l2", "r2", "l3", "r3"
++};
++/* libretro joypad ids, in the order above: B Y SELECT START UP DOWN LEFT
++   RIGHT A X L R L2 R2 L3 R3 = 0..15, which is the order of the names. */
++static const char *const default_keys[NBUTTONS] = {
++	"Z", "A", "RShift", "Return", "Up", "Down", "Left", "Right",
++	"X", "S", "Q", "W", "1", "2", "3", "4"
++};
++static int keymap[ROFE_MAX_PADS][NBUTTONS];       /* INKEY code or -1 */
++/* joystick button n -> psx button (index above), or -1 */
++static int joymap[JOY_MAX_BUTTONS];
++static int joy_deadzone;
++static int analog_sticks;                         /* send sticks to the core */
++static uint16_t pad_bits[ROFE_MAX_PADS];
++static int16_t pad_analog[ROFE_MAX_PADS][2][2];   /* [stick][x/y] */
++static int joy_log;
++static uint32_t joy_last_buttons[ROFE_MAX_PADS];
++
++static unsigned pad_device[ROFE_MAX_PADS];
++
++unsigned host_pad_bits(int port)
++{
++	return port >= 0 && port < ROFE_MAX_PADS ? pad_bits[port] : 0;
++}
++
++int host_pad_analog(int port, int stick, int axis)
++{
++	return port >= 0 && port < ROFE_MAX_PADS && stick >= 0 && stick < 2 && axis >= 0 && axis < 2 ?
++	       pad_analog[port][stick][axis] : 0;
++}
++
++int host_setting_int(const char *key, int def)
++{
++	return choices_get_int(key, def);
++}
++
++static void load_input_map(void)
++{
++	int p, b;
++	static const char *const default_joy =
++		"0=cross 1=circle 2=square 3=triangle 4=l1 5=r1 6=l2 7=r2 "
++		"8=select 9=start 10=l3 11=r3";
++	const char *jm;
++	char key[48];
++
++	for (p = 0; p < ROFE_MAX_PADS; p++)
++		for (b = 0; b < NBUTTONS; b++) {
++			const char *name;
++			snprintf(key, sizeof key, "pad%d.%s", p + 1, button_names[b]);
++			name = choices_get(key);
++			if (name == NULL && p == 0)
++				name = default_keys[b];
++			keymap[p][b] = keys_lookup(name);
++			if (name && keymap[p][b] < 0 && strcasecmp(name, "none") != 0)
++				plat_log("Choices: %s: no key called \"%s\"\n", key, name);
++		}
++
++	for (b = 0; b < JOY_MAX_BUTTONS; b++)
++		joymap[b] = -1;
++	jm = choices_get("joy.buttons");
++	if (jm == NULL)
++		jm = default_joy;
++	while (*jm) {
++		char *end;
++		long n = strtol(jm, &end, 10);
++		if (end != jm && *end == '=') {
++			const char *nm = end + 1;
++			size_t len = strcspn(nm, " ,");
++			for (b = 0; b < NBUTTONS; b++)
++				if (strlen(button_names[b]) == len &&
++				    strncasecmp(button_names[b], nm, len) == 0)
++					break;
++			if (n >= 0 && n < JOY_MAX_BUTTONS && b < NBUTTONS)
++				joymap[n] = b;
++			else
++				plat_log("Choices: joy.buttons: can't use \"%.*s\"\n",
++				         (int)(len + (nm - jm)), jm);
++			jm = nm + len;
++		} else
++			jm = end != jm ? end : jm + 1;
++		while (*jm == ' ' || *jm == ',')
++			jm++;
++	}
++	joy_deadzone = choices_get_int("joy.deadzone", 25);   /* percent */
++	if (joy_deadzone < 0 || joy_deadzone > 90)
++		joy_deadzone = 25;
++	joy_log = choices_get_int("joy.log", 0);
++}
++
++static unsigned pad_type_from_choices(int p)
++{
++	char key[32];
++	const char *t;
++	snprintf(key, sizeof key, "pad%d.type", p + 1);
++	t = choices_get(key);
++	if (t && strcasecmp(t, "analog") == 0)
++		return RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_ANALOG, 0);
++	if (t && strcasecmp(t, "dualshock") == 0)
++		return RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_ANALOG, 1);
++	if (t && strcasecmp(t, "none") == 0)
++		return RETRO_DEVICE_NONE;
++	if (t && strcasecmp(t, "standard") != 0)
++		plat_log("Choices: %s: use standard, analog, dualshock or none\n", key);
++	return RETRO_DEVICE_JOYPAD;
++}
++
++static int deadzoned(int v)
++{
++	int dz = 32767 * joy_deadzone / 100;
++	if (v > -dz && v < dz)
++		return 0;
++	return v;
++}
++
++static void poll_input(int have_focus)
++{
++	struct joy_state js[ROFE_MAX_PADS];
++	int p, b, nj;
++
++	memset(js, 0, sizeof js);
++	nj = plat_joy_poll(js, ROFE_MAX_PADS);
++
++	for (p = 0; p < ROFE_MAX_PADS; p++) {
++		uint16_t bits = 0;
++		int ax = 0, ay = 0, rx = 0, ry = 0;
++
++		if (have_focus)
++			for (b = 0; b < NBUTTONS; b++)
++				if (keymap[p][b] >= 0 && plat_key_down(keymap[p][b]))
++					bits |= 1u << b;
++
++		if (p < nj && js[p].present) {
++			const struct joy_state *j = &js[p];
++			int dx, dy;
++			for (b = 0; b < JOY_MAX_BUTTONS; b++)
++				if ((j->buttons >> b) & 1 && joymap[b] >= 0)
++					bits |= 1u << joymap[b];
++			if (joy_log && j->buttons != joy_last_buttons[p]) {
++				for (b = 0; b < JOY_MAX_BUTTONS; b++)
++					if (((j->buttons ^ joy_last_buttons[p]) >> b) & 1)
++						plat_log("Joystick %d: button %d %s\n", p + 1, b,
++						         (j->buttons >> b) & 1 ? "down" : "up");
++				joy_last_buttons[p] = j->buttons;
++			}
++			ax = deadzoned(j->x);
++			ay = deadzoned(j->y);
++			if (j->has_rstick) {
++				rx = deadzoned(j->rx);
++				ry = deadzoned(j->ry);
++			}
++			/* D-pad: the hat if there is one, else the left stick
++			   (when the stick isn't going to the core as an analogue
++			   stick). */
++			if (j->has_hat) {
++				dx = j->hat_x;
++				dy = j->hat_y;
++			} else if (!analog_sticks ||
++			           pad_device[p] == RETRO_DEVICE_JOYPAD) {
++				dx = ax < 0 ? -1 : ax > 0;
++				dy = ay < 0 ? -1 : ay > 0;
++			} else
++				dx = dy = 0;
++			if (dx < 0) bits |= 1u << RETRO_DEVICE_ID_JOYPAD_LEFT;
++			if (dx > 0) bits |= 1u << RETRO_DEVICE_ID_JOYPAD_RIGHT;
++			if (dy < 0) bits |= 1u << RETRO_DEVICE_ID_JOYPAD_UP;
++			if (dy > 0) bits |= 1u << RETRO_DEVICE_ID_JOYPAD_DOWN;
++		}
++		pad_bits[p] = bits;
++		pad_analog[p][0][0] = ax > 32767 ? 32767 : ax < -32767 ? -32767 : ax;
++		pad_analog[p][0][1] = ay > 32767 ? 32767 : ay < -32767 ? -32767 : ay;
++		pad_analog[p][1][0] = rx > 32767 ? 32767 : rx < -32767 ? -32767 : rx;
++		pad_analog[p][1][1] = ry > 32767 ? 32767 : ry < -32767 ? -32767 : ry;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* libretro callbacks                                                  */
++
++static void core_log(enum retro_log_level level, const char *fmt, ...)
++{
++	char buf[512];
++	va_list ap;
++	static const char *const lv[] = { "debug", "info", "warn", "error" };
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof buf, fmt, ap);
++	va_end(ap);
++	plat_log("[%s] %s", lv[level & 3], buf);
++}
++
++static void set_message(const char *msg, unsigned frames)
++{
++	snprintf(message, sizeof message, "%s", msg);
++	{
++		char *nl = strchr(message, '\n');
++		if (nl)
++			*nl = 0;
++	}
++	message_until = plat_time_cs() + (frames ? frames * 100 / 60 : 300);
++	plat_log("Message: %s\n", message);
++}
++
++static bool environment(unsigned cmd, void *data)
++{
++	switch (cmd) {
++	case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
++		((struct retro_log_callback *)data)->log = core_log;
++		return true;
++	case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
++		*(unsigned *)data = 0;     /* plain SET_VARIABLES */
++		return true;
++	case RETRO_ENVIRONMENT_SET_VARIABLES:
++		opts_set_variables(data);
++		return true;
++	case RETRO_ENVIRONMENT_GET_VARIABLE: {
++		struct retro_variable *v = data;
++		v->value = opt_get(v->key);
++		return v->value != NULL;
++	}
++	case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
++		*(bool *)data = opts_changed != 0;
++		opts_changed = 0;
++		return true;
++	case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
++		return *(enum retro_pixel_format *)data == RETRO_PIXEL_FORMAT_XRGB8888;
++	case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
++		*(const char **)data = sys_dir;
++		return true;
++	case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
++		*(const char **)data = save_dir;
++		return true;
++	case RETRO_ENVIRONMENT_GET_CAN_DUPE:
++		*(bool *)data = true;
++		return true;
++	case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
++		return true;
++	case RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER: {
++		struct retro_framebuffer *fb = data;
++		int pitch = 0;
++		void *p;
++		if (fb_func == NULL)
++			return false;
++		p = fb_func(fb->width, fb->height, &pitch);
++		if (p == NULL)
++			return false;
++		fb->data = p;
++		fb->pitch = pitch;
++		fb->format = RETRO_PIXEL_FORMAT_XRGB8888;
++		fb->access_flags = RETRO_MEMORY_ACCESS_WRITE;
++		fb->memory_flags = RETRO_MEMORY_TYPE_CACHED;
++		return true;
++	}
++	case RETRO_ENVIRONMENT_SET_GEOMETRY:
++		av.geometry = *(const struct retro_game_geometry *)data;
++		return true;
++	case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
++		av = *(const struct retro_system_av_info *)data;
++		return true;
++	case RETRO_ENVIRONMENT_SET_MESSAGE: {
++		const struct retro_message *m = data;
++		set_message(m->msg, m->frames);
++		return true;
++	}
++	case RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION:
++		*(unsigned *)data = 0;
++		return true;
++	case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
++	case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
++	case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL:
++	case RETRO_ENVIRONMENT_SET_MEMORY_MAPS:
++	case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
++	case RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE:
++	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static void video_refresh(const void *data, unsigned width, unsigned height, size_t pitch)
++{
++	if (data == NULL)            /* same picture as before */
++		return;
++	if (fb_func) {
++		int p = 0;
++		void *dst = fb_func(width, height, &p);
++		if (dst == NULL)
++			return;
++		if (dst != data) {       /* the core used its own buffer: copy */
++			unsigned y;
++			for (y = 0; y < height; y++)
++				memcpy((char *)dst + y * p, (const char *)data + y * pitch,
++				       width * 4);
++		}
++		frame.buf = dst;
++		frame.pitch = p;
++	} else {
++		frame.buf = (void *)data;
++		frame.pitch = (int)pitch;
++	}
++	frame.width = (int)width;
++	frame.height = (int)height;
++	new_frame = 1;
++}
++
++static void audio_sample(int16_t l, int16_t r)
++{
++	if (audio_frames < (int)(sizeof audio_buf / 4)) {
++		audio_buf[audio_frames * 2] = l;
++		audio_buf[audio_frames * 2 + 1] = r;
++		audio_frames++;
++	}
++}
++
++static size_t audio_batch(const int16_t *data, size_t frames)
++{
++	size_t room = sizeof audio_buf / 4 - audio_frames;
++	size_t n = frames < room ? frames : room;
++	memcpy(audio_buf + audio_frames * 2, data, n * 4);
++	audio_frames += (int)n;
++	return frames;
++}
++
++static void input_poll(void)
++{
++}
++
++static int16_t input_state(unsigned port, unsigned device, unsigned index, unsigned id)
++{
++	if (port >= ROFE_MAX_PADS)
++		return 0;
++	switch (device & RETRO_DEVICE_MASK) {
++	case RETRO_DEVICE_JOYPAD:
++		if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
++			return (int16_t)pad_bits[port];
++		return id < 16 ? (pad_bits[port] >> id) & 1 : 0;
++	case RETRO_DEVICE_ANALOG:
++		if (index < 2 && id < 2)
++			return pad_analog[port][index][id];
++		return 0;
++	default:
++		return 0;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Files                                                               */
++
++static void make_dirs(const char *path)
++{
++	char tmp[512], *p;
++	snprintf(tmp, sizeof tmp, "%s", path);
++	for (p = tmp + 1; *p; p++)
++		if (*p == '/') {
++			*p = 0;
++			mkdir(tmp, 0777);
++			*p = '/';
++		}
++	mkdir(tmp, 0777);
++}
++
++/* The leaf name without its extension (Unix form: "/a/b/Game.cue"). */
++static void set_game_name(const char *path)
++{
++	const char *leaf = strrchr(path, '/');
++	char *dot;
++	snprintf(game_name, sizeof game_name, "%s", leaf ? leaf + 1 : path);
++	dot = strrchr(game_name, '.');
++	if (dot && dot != game_name)
++		*dot = 0;
++	/* RISC OS names can't hold these; keep state file names simple */
++	for (dot = game_name; *dot; dot++)
++		if (*dot == '.' || *dot == ':' || *dot == '$' || *dot == '&' ||
++		    *dot == '@' || *dot == '^' || *dot == '%' || *dot == '\\' ||
++		    *dot == '#' || *dot == '*' || *dot == '"' || *dot == '|' ||
++		    *dot == ' ' || (unsigned char)*dot == 0xA0 || *dot == '/')
++			*dot = '_';
++}
++
++static int read_file(const char *path, void *buf, size_t size)
++{
++	FILE *f = fopen(path, "rb");
++	size_t n;
++	if (f == NULL)
++		return -1;
++	n = fread(buf, 1, size, f);
++	fclose(f);
++	return (int)n;
++}
++
++static int write_file(const char *path, const void *buf, size_t size)
++{
++	FILE *f = fopen(path, "wb");
++	size_t n;
++	if (f == NULL)
++		return 0;
++	n = fwrite(buf, 1, size, f);
++	if (fclose(f) != 0)
++		n = 0;
++	return n == size;
++}
++
++/* Memory card 1 when the "libretro" type is chosen: saves/<game>.srm */
++static unsigned char *sram_copy;
++static size_t sram_size;
++
++static void sram_path(char *buf, size_t len)
++{
++	snprintf(buf, len, "%s/%s.srm", save_dir, game_name);
++}
++
++static void sram_load(void)
++{
++	char path[640];
++	void *mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
++	size_t size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
++	free(sram_copy);
++	sram_copy = NULL;
++	sram_size = 0;
++	if (mem == NULL || size == 0)
++		return;
++	sram_path(path, sizeof path);
++	if (read_file(path, mem, size) > 0)
++		plat_log("Memory card from %s\n", path);
++	sram_copy = malloc(size);
++	if (sram_copy) {
++		memcpy(sram_copy, mem, size);
++		sram_size = size;
++	}
++}
++
++void host_flush_saves(void)
++{
++	char path[640];
++	void *mem;
++	if (!game_loaded || sram_copy == NULL)
++		return;
++	mem = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
++	if (mem == NULL || memcmp(mem, sram_copy, sram_size) == 0)
++		return;
++	make_dirs(save_dir);
++	sram_path(path, sizeof path);
++	if (write_file(path, mem, sram_size)) {
++		memcpy(sram_copy, mem, sram_size);
++		plat_log("Memory card saved to %s\n", path);
++	} else
++		plat_log("Couldn't write %s: %s\n", path, strerror(errno));
++}
++
++/* ------------------------------------------------------------------ */
++/* The interface for wimp.c                                            */
++
++int host_init(const char *system_dir, const char *save_d, const char *state_d,
++              host_fb_func fb)
++{
++	snprintf(sys_dir, sizeof sys_dir, "%s", system_dir);
++	snprintf(save_dir, sizeof save_dir, "%s", save_d);
++	snprintf(state_dir, sizeof state_dir, "%s", state_d);
++	make_dirs(sys_dir);
++	make_dirs(save_dir);
++	fb_func = fb;
++	load_input_map();
++	analog_sticks = 1;
++
++	retro_set_environment(environment);
++	retro_set_video_refresh(video_refresh);
++	retro_set_audio_sample(audio_sample);
++	retro_set_audio_sample_batch(audio_batch);
++	retro_set_input_poll(input_poll);
++	retro_set_input_state(input_state);
++	retro_init();
++	plat_log("Core: %d options\n", nopts);
++	return 1;
++}
++
++void host_shutdown(void)
++{
++	int i;
++	host_unload_game();
++	retro_deinit();
++	if (audio_open)
++		plat_audio_close();
++	audio_open = 0;
++	for (i = 0; i < nopts; i++)
++		free(opts[i].values);
++	nopts = 0;
++}
++
++int host_load_game(const char *path)
++{
++	struct retro_game_info info;
++	int p;
++
++	host_unload_game();
++	memset(&info, 0, sizeof info);
++	info.path = path;
++	set_game_name(path);
++	plat_log("Loading %s\n", path);
++	if (!retro_load_game(&info)) {
++		plat_log("The core couldn't load %s\n", path);
++		game_name[0] = 0;
++		return 0;
++	}
++	game_loaded = 1;
++	{
++		int i;
++		for (i = 0; i < nopts; i++)
++			plat_log("Option %s: %s\n", opts[i].key, opts[i].value);
++	}
++	for (p = 0; p < ROFE_MAX_PADS; p++) {
++		pad_device[p] = pad_type_from_choices(p);
++		retro_set_controller_port_device(p, pad_device[p]);
++	}
++	retro_get_system_av_info(&av);
++	plat_log("Loaded \"%s\": %dx%d, %.3f fps, %.0f Hz\n", game_name,
++	         av.geometry.base_width, av.geometry.base_height,
++	         av.timing.fps, av.timing.sample_rate);
++	sram_load();
++	if (!audio_open && choices_get_int("sound", 1)) {
++		int rate = (int)(av.timing.sample_rate + 0.5);
++		int block = (int)(rate / av.timing.fps + 1) * 4;
++		audio_open = plat_audio_open(rate, block);
++	}
++	frame.buf = NULL;
++	return 1;
++}
++
++void host_unload_game(void)
++{
++	if (!game_loaded)
++		return;
++	host_flush_saves();
++	retro_unload_game();
++	game_loaded = 0;
++	game_name[0] = 0;
++	frame.buf = NULL;
++	free(sram_copy);
++	sram_copy = NULL;
++	if (audio_open)
++		plat_audio_pause(1);
++}
++
++int host_game_loaded(void)
++{
++	return game_loaded;
++}
++
++const char *host_game_name(void)
++{
++	return game_name;
++}
++
++void host_reset(void)
++{
++	if (game_loaded)
++		retro_reset();
++}
++
++double host_fps(void)
++{
++	return av.timing.fps > 1 ? av.timing.fps : 60.0;
++}
++
++int host_audio_rate(void)
++{
++	return audio_open ? (int)(av.timing.sample_rate + 0.5) : 0;
++}
++
++void host_run_frame(int have_focus)
++{
++	if (!game_loaded)
++		return;
++	poll_input(have_focus);
++	audio_frames = 0;
++	retro_run();
++	if (audio_open && audio_frames)
++		plat_audio_write(audio_buf, audio_frames * 4);
++}
++
++const struct host_video *host_frame(int *is_new)
++{
++	if (is_new) {
++		*is_new = new_frame;
++		new_frame = 0;
++	}
++	return frame.buf ? &frame : NULL;
++}
++
++static void state_path(char *buf, size_t len, int slot)
++{
++	snprintf(buf, len, "%s/%s/%d", state_dir, game_name, slot);
++}
++
++int host_save_state(int slot)
++{
++	char path[700], dir[640];
++	size_t size;
++	void *buf;
++	int ok;
++	if (!game_loaded)
++		return 0;
++	size = retro_serialize_size();
++	buf = malloc(size);
++	if (buf == NULL)
++		return 0;
++	ok = retro_serialize(buf, size);
++	if (ok) {
++		snprintf(dir, sizeof dir, "%s/%s", state_dir, game_name);
++		make_dirs(dir);
++		state_path(path, sizeof path, slot);
++		ok = write_file(path, buf, size);
++		plat_log("Save state %d to %s: %s\n", slot, path, ok ? "done" : strerror(errno));
++	}
++	free(buf);
++	return ok;
++}
++
++int host_load_state(int slot)
++{
++	char path[700];
++	size_t size;
++	void *buf;
++	int n, ok = 0;
++	if (!game_loaded)
++		return 0;
++	size = retro_serialize_size();
++	buf = malloc(size);
++	if (buf == NULL)
++		return 0;
++	state_path(path, sizeof path, slot);
++	n = read_file(path, buf, size);
++	if (n > 0)
++		ok = retro_unserialize(buf, (size_t)n);
++	plat_log("Load state %d from %s: %s\n", slot, path,
++	         n <= 0 ? "no such file" : ok ? "done" : "refused");
++	free(buf);
++	return ok;
++}
++
++void host_reload_choices(void)
++{
++	int p;
++	load_input_map();
++	opts_resolve();
++	if (game_loaded)
++		for (p = 0; p < ROFE_MAX_PADS; p++) {
++			unsigned d = pad_type_from_choices(p);
++			if (d != pad_device[p]) {
++				pad_device[p] = d;
++				retro_set_controller_port_device(p, d);
++			}
++		}
++}
++
++const char *host_message(unsigned now)
++{
++	if (message[0] && (int)(message_until - now) > 0)
++		return message;
++	return NULL;
++}
+diff --git a/frontend/riscos/keys.c b/frontend/riscos/keys.c
+new file mode 100644
+index 00000000..3e62bbd1
+--- /dev/null
++++ b/frontend/riscos/keys.c
+@@ -0,0 +1,60 @@
++/*
++ * Key names for the Choices file, and their RISC OS internal key numbers
++ * (the INKEY codes that OS_Byte 121 tests: PRM "Keyboard Scan Codes").
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <string.h>
++#include <strings.h>
++#include "rofe.h"
++
++static const struct { const char *name; int code; } keys[] = {
++	{ "Shift", 0 }, { "Ctrl", 1 }, { "Alt", 2 },
++	{ "LShift", 3 }, { "LCtrl", 4 }, { "LAlt", 5 },
++	{ "RShift", 6 }, { "RCtrl", 7 }, { "RAlt", 8 },
++	{ "Q", 16 }, { "3", 17 }, { "4", 18 }, { "5", 19 }, { "F4", 20 },
++	{ "8", 21 }, { "F7", 22 }, { "Minus", 23 }, { "Left", 25 },
++	{ "Keypad6", 26 }, { "Keypad7", 27 }, { "F11", 28 }, { "F12", 29 },
++	{ "F10", 30 }, { "ScrollLock", 31 }, { "Print", 32 }, { "W", 33 },
++	{ "E", 34 }, { "T", 35 }, { "7", 36 }, { "I", 37 }, { "9", 38 },
++	{ "0", 39 }, { "Down", 41 }, { "Keypad8", 42 }, { "Keypad9", 43 },
++	{ "Break", 44 }, { "Backquote", 45 }, { "Backspace", 47 }, { "1", 48 },
++	{ "2", 49 }, { "D", 50 }, { "R", 51 }, { "6", 52 }, { "U", 53 },
++	{ "O", 54 }, { "P", 55 }, { "LeftBracket", 56 }, { "Up", 57 },
++	{ "KeypadPlus", 58 }, { "KeypadMinus", 59 }, { "KeypadEnter", 60 },
++	{ "Insert", 61 }, { "Home", 62 }, { "PageUp", 63 }, { "CapsLock", 64 },
++	{ "A", 65 }, { "X", 66 }, { "F", 67 }, { "Y", 68 }, { "J", 69 },
++	{ "K", 70 }, { "Return", 73 }, { "KeypadSlash", 74 },
++	{ "KeypadDot", 76 }, { "NumLock", 77 }, { "PageDown", 78 },
++	{ "Quote", 79 }, { "S", 81 }, { "C", 82 }, { "G", 83 }, { "H", 84 },
++	{ "N", 85 }, { "L", 86 }, { "Semicolon", 87 }, { "RightBracket", 88 },
++	{ "Delete", 89 }, { "KeypadHash", 90 }, { "KeypadStar", 91 },
++	{ "Equals", 93 }, { "Backslash", 120 }, { "Tab", 96 }, { "Z", 97 },
++	{ "Space", 98 }, { "V", 99 }, { "B", 100 }, { "M", 101 },
++	{ "Comma", 102 }, { "Dot", 103 }, { "Slash", 104 }, { "End", 105 },
++	{ "Keypad0", 106 }, { "Keypad1", 107 }, { "Keypad3", 108 },
++	{ "Escape", 112 }, { "F1", 113 }, { "F2", 114 }, { "F3", 115 },
++	{ "F5", 116 }, { "F6", 117 }, { "F8", 118 }, { "F9", 119 },
++	{ "Right", 121 }, { "Keypad4", 122 }, { "Keypad5", 123 },
++	{ "Keypad2", 124 }, { "LLogo", 125 }, { "RLogo", 126 }, { "Menu", 127 },
++};
++
++int keys_lookup(const char *name)
++{
++	size_t i;
++	if (name == NULL)
++		return -1;
++	for (i = 0; i < sizeof keys / sizeof keys[0]; i++)
++		if (strcasecmp(keys[i].name, name) == 0)
++			return keys[i].code;
++	return -1;
++}
++
++const char *keys_name(int code)
++{
++	size_t i;
++	for (i = 0; i < sizeof keys / sizeof keys[0]; i++)
++		if (keys[i].code == code)
++			return keys[i].name;
++	return "?";
++}
+diff --git a/frontend/riscos/plat_riscos.c b/frontend/riscos/plat_riscos.c
+new file mode 100644
+index 00000000..ed736134
+--- /dev/null
++++ b/frontend/riscos/plat_riscos.c
+@@ -0,0 +1,453 @@
++/*
++ * The plat_* calls on RISC OS (see rofe.h).
++ *
++ * Sound goes to SharedSoundBuffer / StreamManager (John Duffell's
++ * modules, loaded by !Run) from this task's own poll loop: no threads, no
++ * interrupt code of ours. It's the same use of the SWIs as riscos-mesa's
++ * SDL driver and Reel: fixed-size blocks, paused until two are queued,
++ * BufferStats' added - played (which some versions count in blocks) for
++ * how much is still to play.
++ *
++ * Joysticks: USBJoystick 0.23+'s own API (Joystick_Enumerate,
++ * _DeviceInfo, _AxisInfo, _AxisValues), as in the YSFlight port; any
++ * other Joystick module through Joystick_Read (stick 0 only).
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdarg.h>
++#include <kernel.h>
++#include <swis.h>
++#include "rofe.h"
++
++/* ---- log ---- */
++
++void plat_log(const char *fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fflush(stderr);
++}
++
++/* ---- keyboard, clock ---- */
++
++int plat_key_down(int inkey)
++{
++	int r1 = 0;
++	if (inkey < 0 || inkey > 127)
++		return 0;
++	/* OS_Byte 121, X = key EOR &80: test that one key; X=&FF if down */
++	if (_swix(OS_Byte, _INR(0, 1) | _OUT(1), 121, inkey ^ 0x80, &r1))
++		return 0;
++	return (r1 & 0xff) == 0xff;
++}
++
++unsigned plat_time_cs(void)
++{
++	unsigned t = 0;
++	_swix(OS_ReadMonotonicTime, _OUT(0), &t);
++	return t;
++}
++
++/* ---- sound ---- */
++
++#define SharedSoundBuffer_OpenStream         0x55FC0
++#define SharedSoundBuffer_CloseStream        0x55FC1
++#define SharedSoundBuffer_Volume             0x55FC4
++#define SharedSoundBuffer_SampleRate         0x55FC5
++#define SharedSoundBuffer_Pause              0x55FC9
++#define SharedSoundBuffer_ReturnStreamHandle 0x55FCE
++#define StreamManager_AddBlock               0x57282
++#define StreamManager_SetBuffer              0x57287
++#define StreamManager_BufferStats            0x57288
++
++static int ssb_handle, sm_stream, ssb_block, ssb_started, ssb_paused;
++static unsigned added_bytes, added_blocks, refused;
++static int start_now;          /* resume: play what's queued at once */
++static unsigned char *pend;
++static int pend_len, pend_size;
++
++static int swi_exists(const char *name)
++{
++	int n;
++	return _swix(OS_SWINumberFromString, _IN(1) | _OUT(0), name, &n) == NULL;
++}
++
++static _kernel_oserror *ssb(int swi, int r0, int r1, int r2, _kernel_swi_regs *out)
++{
++	_kernel_swi_regs r;
++	r.r[0] = r0;
++	r.r[1] = r1;
++	r.r[2] = r2;
++	return _kernel_swi(swi | 0x20000, &r, out ? out : &r);
++}
++
++int plat_audio_open(int rate, int block_bytes)
++{
++	_kernel_swi_regs r;
++	_kernel_oserror *e;
++
++	if (!swi_exists("SharedSoundBuffer_OpenStream") ||
++	    !swi_exists("StreamManager_AddBlock")) {
++		plat_log("Sound: SharedSoundBuffer/StreamManager aren't loaded: no sound\n");
++		return 0;
++	}
++	/* whole blocks of about 1024 sample frames (23 ms) */
++	(void)block_bytes;
++	ssb_block = 1024 * 4;
++	pend_size = ssb_block * 8;
++	pend = malloc(pend_size);
++	if (pend == NULL)
++		return 0;
++	pend_len = 0;
++	if ((e = ssb(SharedSoundBuffer_OpenStream, 2, (int)"PCSX", ssb_block, &r)) != NULL) {
++		plat_log("Sound: SharedSoundBuffer_OpenStream: %s\n", e->errmess);
++		free(pend);
++		pend = NULL;
++		return 0;
++	}
++	ssb_handle = r.r[0];
++	if ((e = ssb(SharedSoundBuffer_ReturnStreamHandle, ssb_handle, 0, 0, &r)) != NULL) {
++		plat_log("Sound: SharedSoundBuffer_ReturnStreamHandle: %s\n", e->errmess);
++		ssb(SharedSoundBuffer_CloseStream, ssb_handle, 0, 0, NULL);
++		ssb_handle = 0;
++		free(pend);
++		pend = NULL;
++		return 0;
++	}
++	sm_stream = r.r[0];
++	ssb(StreamManager_SetBuffer, sm_stream, rate * 4 + ssb_block * 4, 0, NULL);
++	ssb(SharedSoundBuffer_SampleRate, ssb_handle, rate * 1024, 0, NULL);
++	ssb(SharedSoundBuffer_Volume, ssb_handle, (int)0xFFFFFFFF, 0, NULL);
++	ssb(SharedSoundBuffer_Pause, ssb_handle, 0, 0, NULL);     /* paused */
++	ssb_started = 0;
++	ssb_paused = 0;
++	added_bytes = added_blocks = refused = 0;
++	start_now = 0;
++	plat_log("Sound: SharedSoundBuffer stream %#x, %d Hz, blocks of %d bytes\n",
++	         ssb_handle, rate, ssb_block);
++	return 1;
++}
++
++void plat_audio_close(void)
++{
++	if (ssb_handle)
++		ssb(SharedSoundBuffer_CloseStream, ssb_handle, 0, 0, NULL);
++	ssb_handle = sm_stream = 0;
++	free(pend);
++	pend = NULL;
++}
++
++static void push_blocks(void)
++{
++	int off = 0;
++	while (pend_len - off >= ssb_block) {
++		_kernel_oserror *e = ssb(StreamManager_AddBlock, sm_stream,
++		                         (int)(pend + off), ssb_block, NULL);
++		if (e) {
++			if (!refused++)
++				plat_log("Sound: StreamManager_AddBlock refused a block: %s\n", e->errmess);
++			break;
++		}
++		off += ssb_block;
++		added_bytes += ssb_block;
++		added_blocks++;
++	}
++	if (off) {
++		memmove(pend, pend + off, pend_len - off);
++		pend_len -= off;
++	}
++	if (!ssb_started && !ssb_paused && (added_blocks >= 2 || start_now)) {
++		start_now = 0;
++		ssb(SharedSoundBuffer_Pause, ssb_handle, 1, 0, NULL);  /* play */
++		ssb_started = 1;
++		plat_log("Sound: starts\n");
++	}
++}
++
++int plat_audio_write(const void *data, int bytes)
++{
++	if (!ssb_handle)
++		return 0;
++	if (pend_len + bytes > pend_size) {
++		/* too far ahead (the sound isn't being played): drop the oldest */
++		int drop = pend_len + bytes - pend_size;
++		if (drop > pend_len)
++			drop = pend_len;
++		memmove(pend, pend + drop, pend_len - drop);
++		pend_len -= drop;
++		if (bytes > pend_size)
++			bytes = pend_size;
++	}
++	memcpy(pend + pend_len, data, bytes);
++	pend_len += bytes;
++	push_blocks();
++	return bytes;
++}
++
++int plat_audio_queued(void)
++{
++	_kernel_swi_regs r;
++	unsigned added, played;
++	if (!sm_stream || ssb(StreamManager_BufferStats, sm_stream, 0, 0, &r))
++		return -1;
++	added = (unsigned)r.r[0];
++	played = (unsigned)r.r[1];
++	if (added == added_blocks && added != added_bytes) {   /* counts blocks */
++		added *= ssb_block;
++		played *= ssb_block;
++	}
++	return (int)(added > played ? added - played : 0) + pend_len;
++}
++
++void plat_audio_pause(int pause)
++{
++	if (!ssb_handle)
++		return;
++	ssb_paused = pause;
++	if (pause) {
++		if (ssb_started)
++			ssb(SharedSoundBuffer_Pause, ssb_handle, 0, 0, NULL);
++		ssb_started = 0;
++		start_now = 1;          /* anything queued plays at once on resume */
++	} else
++		push_blocks();
++}
++
++/* ---- joysticks ---- */
++
++#define UJ_Read        0x43F40
++#define UJ_Enumerate   0x43F44
++#define UJ_DeviceInfo  0x43F45
++#define UJ_AxisInfo    0x43F46
++#define UJ_AxisValues  0x43F47
++
++enum {
++	UJ_AXIS_HATX = 1, UJ_AXIS_HATY = 2, UJ_AXIS_DPADX = 3, UJ_AXIS_DPADY = 4,
++	UJ_AXIS_X = 5, UJ_AXIS_Y = 6, UJ_AXIS_Z = 7, UJ_AXIS_RX = 8,
++	UJ_AXIS_RY = 9, UJ_AXIS_RZ = 10, UJ_AXIS_SLIDER = 11
++};
++
++/* USBJoystick's records (h.joyswis); only the leading fields are used,
++   and the record size comes from the SWI. */
++struct uj_device_info {
++	uint32_t size;
++	const char *manufacturer, *product, *serial;
++	uint32_t vendor_id, product_id, num_axes, num_buttons, num_hats;
++};
++struct uj_axis_info {
++	uint32_t hid_usage_page, hid_usage, type;
++	const char *name;
++	int32_t min, mid, max;
++	int32_t is_digital;
++};
++
++struct joy_dev {
++	int slot;
++	int ax[4];            /* module axis for x, y, rx, ry (-1 = none) */
++	int32_t min[4], mid[4], max[4];
++	int hat[2];           /* module axes for the hat/D-pad x, y */
++	int nbuttons;
++	char name[64];
++};
++
++static int joy_mode = -1;      /* -1 not looked, 0 none, 1 USBJoystick, 2 Joystick_Read */
++static struct joy_dev joys[ROFE_MAX_PADS];
++static int njoys;
++static uint32_t joy_mask, joy_gen;
++static unsigned joy_next_scan;
++static int scanned;
++
++static void joy_setup(struct joy_dev *d)
++{
++	_kernel_swi_regs r;
++	const struct uj_device_info *dev;
++	const unsigned char *rec;
++	int rec_size, naxes, a, i, pass;
++	static const unsigned want[4][2] = {
++		{ UJ_AXIS_X, 0 }, { UJ_AXIS_Y, 0 },
++		{ UJ_AXIS_RX, UJ_AXIS_Z }, { UJ_AXIS_RY, UJ_AXIS_RZ }
++	};
++
++	for (i = 0; i < 4; i++)
++		d->ax[i] = -1;
++	d->hat[0] = d->hat[1] = -1;
++	d->nbuttons = 0;
++	snprintf(d->name, sizeof d->name, "USB joystick");
++
++	r.r[0] = d->slot;
++	if (_kernel_swi(UJ_DeviceInfo | 0x20000, &r, &r) == NULL && r.r[2]) {
++		dev = (const struct uj_device_info *)r.r[2];
++		if (dev->product && dev->product[0])
++			snprintf(d->name, sizeof d->name, "%s", dev->product);
++		d->nbuttons = (int)dev->num_buttons;
++	}
++	r.r[0] = d->slot;
++	if (_kernel_swi(UJ_AxisInfo | 0x20000, &r, &r) != NULL || r.r[3] == 0 ||
++	    r.r[1] < (int)sizeof(struct uj_axis_info))
++		return;
++	rec_size = r.r[1];
++	naxes = r.r[2];
++	rec = (const unsigned char *)r.r[3];
++
++	/* sticks: X, Y; the right stick is RX/RY, else Z/RZ */
++	for (i = 0; i < 4; i++)
++		for (pass = 0; pass < 2 && d->ax[i] < 0; pass++)
++			for (a = 0; a < naxes; a++) {
++				const struct uj_axis_info *ai = (const void *)(rec + a * rec_size);
++				if (want[i][pass] && ai->type == want[i][pass] && !ai->is_digital) {
++					d->ax[i] = a;
++					d->min[i] = ai->min;
++					d->mid[i] = ai->mid;
++					d->max[i] = ai->max;
++					break;
++				}
++			}
++	if ((d->ax[2] < 0) != (d->ax[3] < 0))
++		d->ax[2] = d->ax[3] = -1;
++	/* the first hat, else the first D-pad */
++	for (pass = 0; pass < 2 && d->hat[0] < 0; pass++) {
++		unsigned tx = pass ? UJ_AXIS_DPADX : UJ_AXIS_HATX;
++		unsigned ty = pass ? UJ_AXIS_DPADY : UJ_AXIS_HATY;
++		int hx = -1, hy = -1;
++		for (a = 0; a < naxes; a++) {
++			const struct uj_axis_info *ai = (const void *)(rec + a * rec_size);
++			if (ai->type == tx && hx < 0) hx = a;
++			if (ai->type == ty && hy < 0) hy = a;
++		}
++		if (hx >= 0 && hy >= 0) {
++			d->hat[0] = hx;
++			d->hat[1] = hy;
++		}
++	}
++	plat_log("Joystick: slot %d \"%s\": %d axes, %d buttons%s%s\n", d->slot, d->name,
++	         naxes, d->nbuttons, d->hat[0] >= 0 ? ", hat/D-pad" : "",
++	         d->ax[2] >= 0 ? ", right stick" : "");
++}
++
++static void joy_scan(void)
++{
++	_kernel_swi_regs r;
++	int slot;
++
++	if (joy_mode <= 0) {      /* (looked again each second until there is one) */
++		int was = joy_mode;
++		if (swi_exists("Joystick_Enumerate"))
++			joy_mode = 1;
++		else if (swi_exists("Joystick_Read"))
++			joy_mode = 2;
++		else
++			joy_mode = 0;
++		if (joy_mode != was)
++			plat_log("Joystick: %s\n", joy_mode == 1 ? "USBJoystick" :
++		         joy_mode == 2 ? "Joystick_Read (stick 0)" : "no Joystick module");
++	}
++	if (joy_mode != 1)
++		return;
++	if (_kernel_swi(UJ_Enumerate | 0x20000, &r, &r) != NULL)
++		return;
++	if ((uint32_t)r.r[0] == joy_mask && (uint32_t)r.r[1] == joy_gen && scanned)
++		return;
++	scanned = 1;
++	joy_mask = (uint32_t)r.r[0];
++	joy_gen = (uint32_t)r.r[1];
++	njoys = 0;
++	for (slot = 0; slot < 32 && njoys < ROFE_MAX_PADS; slot++)
++		if (joy_mask & (1u << slot)) {
++			joys[njoys].slot = slot;
++			joy_setup(&joys[njoys]);
++			njoys++;
++		}
++	if (njoys == 0)
++		plat_log("Joystick: none attached\n");
++}
++
++/* raw value -> -32767..32767 about the axis' own mid point */
++static int norm(int32_t v, int32_t min, int32_t mid, int32_t max)
++{
++	long long n;
++	if (v >= mid) {
++		if (max <= mid)
++			return 0;
++		n = (long long)(v - mid) * 32767 / (max - mid);
++	} else {
++		if (mid <= min)
++			return 0;
++		n = -(long long)(mid - v) * 32767 / (mid - min);
++	}
++	return n > 32767 ? 32767 : n < -32767 ? -32767 : (int)n;
++}
++
++int plat_joy_poll(struct joy_state *js, int max)
++{
++	unsigned now = plat_time_cs();
++	int i, n = 0;
++
++	if (joy_mode < 0 || (int)(now - joy_next_scan) >= 0) {
++		joy_scan();
++		joy_next_scan = now + 100;          /* look for new pads each second */
++	}
++	if (joy_mode == 2 && max > 0) {
++		_kernel_swi_regs r;
++		r.r[0] = 256;                       /* 16-bit read, stick 0 */
++		if (_kernel_swi(UJ_Read | 0x20000, &r, &r) == NULL) {
++			unsigned pos = (unsigned)r.r[0];
++			js[0].present = 1;
++			js[0].x = norm((pos >> 16) & 0xffff, 0, 32768, 65535);
++			/* UJ_Read: Y is 65535 at the top */
++			js[0].y = -norm(pos & 0xffff, 0, 32768, 65535);
++			js[0].buttons = (uint32_t)r.r[1];
++			snprintf(js[0].name, sizeof js[0].name, "Joystick");
++			return 1;
++		}
++		return 0;
++	}
++	if (joy_mode != 1)
++		return 0;
++	for (i = 0; i < njoys && n < max; i++) {
++		struct joy_dev *d = &joys[i];
++		struct joy_state *s = &js[n++];
++		_kernel_swi_regs r;
++		int vsize, naxes, k;
++		const unsigned char *val;
++
++		memset(s, 0, sizeof *s);
++		snprintf(s->name, sizeof s->name, "%s", d->name);
++		r.r[0] = d->slot;
++		if (_kernel_swi(UJ_AxisValues | 0x20000, &r, &r) != NULL || r.r[3] == 0)
++			continue;                       /* unplugged: centred, released */
++		vsize = r.r[1];
++		naxes = r.r[2];
++		val = (const unsigned char *)r.r[3];
++		s->present = 1;
++		s->buttons = (uint32_t)r.r[4];
++#define AXV(a, out) do { int32_t v_ = 0; \
++		if ((a) >= 0 && (a) < naxes && vsize >= 4) memcpy(&v_, val + (a) * vsize, 4); \
++		out = v_; } while (0)
++		for (k = 0; k < 4; k++)
++			if (d->ax[k] >= 0) {
++				int32_t v;
++				AXV(d->ax[k], v);
++				v = norm(v, d->min[k], d->mid[k], d->max[k]);
++				if (k == 0) s->x = v;
++				else if (k == 1) s->y = v;
++				else if (k == 2) s->rx = v;
++				else s->ry = v;
++			}
++		s->has_rstick = d->ax[2] >= 0;
++		if (d->hat[0] >= 0) {
++			int32_t hx, hy;
++			AXV(d->hat[0], hx);
++			AXV(d->hat[1], hy);
++			s->hat_x = hx < 0 ? -1 : hx > 0;
++			s->hat_y = hy < 0 ? -1 : hy > 0;
++			s->has_hat = 1;
++		}
++#undef AXV
++	}
++	return n;
++}
+diff --git a/frontend/riscos/rofe.h b/frontend/riscos/rofe.h
+new file mode 100644
+index 00000000..433ad237
+--- /dev/null
++++ b/frontend/riscos/rofe.h
+@@ -0,0 +1,97 @@
++/*
++ * !PCSX: the RISC OS frontend for PCSX ReARMed's libretro core.
++ *
++ *   host.c      the libretro host: environment, core options, input, sound
++ *               queueing, save states, loading discs. Portable C; it reaches
++ *               RISC OS only through the plat_* calls below, so the same
++ *               file runs in the Linux tests (tests/headless.c).
++ *   choices.c   the Choices file (key: value lines).
++ *   keys.c      key names <-> RISC OS internal key numbers (INKEY codes).
++ *   plat_riscos.c  the plat_* calls on RISC OS: keyboard scan (OS_Byte 121),
++ *               USBJoystick, SharedSoundBuffer, the clock.
++ *   wimp.c      the desktop: icon bar, window, full screen, menus, the
++ *               sprite the core draws into, the poll loop.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#ifndef ROFE_H
++#define ROFE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifndef ROFE_VERSION
++#define ROFE_VERSION "r26-riscos"
++#endif
++#define ROFE_MAX_PADS 2
++
++/* ---- choices.c ---- */
++void choices_clear(void);
++int choices_load(const char *path);          /* 0 if the file couldn't be read */
++const char *choices_get(const char *key);    /* NULL if not set */
++int choices_get_int(const char *key, int def);
++void choices_set(const char *key, const char *value);
++
++/* ---- keys.c ---- */
++int keys_lookup(const char *name);           /* INKEY code (0-127), or -1 */
++const char *keys_name(int code);
++
++/* ---- plat_*: what host.c needs from the machine ---- */
++int plat_key_down(int inkey);                /* only called while we have focus */
++unsigned plat_time_cs(void);                 /* monotonic, centiseconds */
++void plat_log(const char *fmt, ...);
++
++/* Sound: 16-bit signed stereo, 44100 Hz. */
++int plat_audio_open(int rate, int block_bytes);   /* 0 = no sound */
++void plat_audio_close(void);
++int plat_audio_write(const void *data, int bytes); /* bytes taken */
++int plat_audio_queued(void);                 /* bytes not yet played, -1 = unknown */
++void plat_audio_pause(int pause);
++
++/* Joysticks (USBJoystick). Values are normalised by plat_riscos.c. */
++#define JOY_MAX_BUTTONS 32
++struct joy_state {
++	int present;
++	int x, y, rx, ry;          /* -32768..32767, 0 centred; Y negative = up */
++	int has_rstick;
++	int hat_x, hat_y;          /* -1/0/1, Y -1 = up */
++	int has_hat;
++	uint32_t buttons;          /* bit n = button n */
++	char name[64];
++};
++int plat_joy_poll(struct joy_state *js, int max);   /* returns how many */
++
++/* ---- host.c: what wimp.c (or the test) calls ---- */
++struct host_video {
++	void *buf;          /* where the core draws (frame rows at buf, pitch) */
++	int width, height;  /* the current frame */
++	int pitch;          /* bytes */
++};
++/* The frontend gives the core a buffer to draw into (the sprite image). */
++typedef void *(*host_fb_func)(int width, int height, int *pitch);
++
++int host_init(const char *system_dir, const char *save_dir,
++              const char *state_dir, host_fb_func fb);
++void host_shutdown(void);
++int host_load_game(const char *unix_path);  /* 1 = loaded */
++void host_unload_game(void);
++int host_game_loaded(void);
++const char *host_game_name(void);
++void host_reset(void);
++void host_run_frame(int have_focus);        /* one emulated frame */
++double host_fps(void);
++int host_audio_rate(void);
++/* The last frame (NULL if none yet); *changed set if the size changed. */
++const struct host_video *host_frame(int *new_frame);
++int host_save_state(int slot);              /* 1 = done */
++int host_load_state(int slot);
++void host_reload_choices(void);             /* core options from Choices */
++void host_flush_saves(void);                /* write libretro-managed cards */
++const char *host_message(unsigned now_cs);  /* the core's latest message, or NULL */
++/* the pad state last given to the core (for tests and the log) */
++unsigned host_pad_bits(int port);
++int host_pad_analog(int port, int stick, int axis);
++/* frontend settings, from Choices */
++int host_setting_int(const char *key, int def);
++
++#endif
+diff --git a/frontend/riscos/wimp.c b/frontend/riscos/wimp.c
+new file mode 100644
+index 00000000..55899ed5
+--- /dev/null
++++ b/frontend/riscos/wimp.c
+@@ -0,0 +1,872 @@
++/*
++ * !PCSX's desktop: a Wimp task with an icon bar icon, a game window and a
++ * borderless full screen window, built in code (no Templates).
++ *
++ * The picture: the core draws each frame straight into the image of a
++ * 32bpp sprite (RISC OS TBGR order; see cspace_riscos.c), which is
++ * plotted with OS_SpriteOp 52 (put scaled) inside Wimp_UpdateWindow /
++ * Wimp_RedrawWindow. The sprite is always at least 1 MB, with unseen rows
++ * below the picture: riscos-mesa found that on the Pi 4 small sprites keep
++ * showing what they held the first time they were plotted.
++ *
++ * Pacing: with sound, frames are run while less than the target amount of
++ * sound is queued (the sound hardware is the clock); without, by the
++ * centisecond timer. The task runs on null events (Wimp_PollIdle), so it
++ * multitasks.
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <kernel.h>
++#include <swis.h>
++#include <unixlib/local.h>
++#include "libretro.h"
++#include "rofe.h"
++
++/* The heap goes in a dynamic area named after us, up to 96 MB. */
++const char *const __dynamic_da_name = "PCSX Heap";
++int __dynamic_da_max_size = 96 << 20;
++
++#define APP "PCSX"
++#define TASK_WORD 0x4B534154
++
++#define Message_Quit        0
++#define Message_DataLoad    3
++#define Message_DataLoadAck 4
++#define Message_PreQuit     8
++#define Message_ModeChange  0x400C1
++
++#define KEY_F(n) (0x180 + (n))
++#define KEY_F10 0x1CA
++#define KEY_F11 0x1CB
++
++static int task;
++static int win_desk = -1, win_full = -1;
++static int fullscreen, paused, closed;
++static char title[160];
++
++/* screen */
++static int eigx, eigy, scr_w, scr_h;     /* pixels */
++static int scale;                         /* desktop window: 320*scale x 240*scale */
++
++/* the sprite */
++#define SPR_HDR 44
++#define AREA_HDR 16
++#define MIN_SPRITE_BYTES (1 << 20)
++static int *area;
++static size_t area_size;
++static int spr_w, spr_h, spr_rows;        /* frame size; rows in the sprite */
++
++/* timing / stats */
++static unsigned t_stats, frames_run, frames_shown, run_cs, show_cs;
++static unsigned t_title, fps_frames;
++static int fps_shown;
++static unsigned t_due0;
++static double frames_due_done;
++static int state_slot;
++static unsigned t_flush;
++static int log_frames;
++
++static int audio_target;                  /* bytes queued we aim for */
++
++/* ------------------------------------------------------------------ */
++
++static void report(const char *msg)
++{
++	_kernel_oserror e;
++	e.errnum = 0;
++	snprintf(e.errmess, sizeof e.errmess, "%s", msg);
++	_swix(Wimp_ReportError, _INR(0, 2), &e, 1, APP);
++}
++
++static void read_mode(void)
++{
++	int xl = 0, yl = 0;
++	_swix(OS_ReadModeVariable, _INR(0, 1) | _OUT(2), -1, 4, &eigx);
++	_swix(OS_ReadModeVariable, _INR(0, 1) | _OUT(2), -1, 5, &eigy);
++	_swix(OS_ReadModeVariable, _INR(0, 1) | _OUT(2), -1, 11, &xl);
++	_swix(OS_ReadModeVariable, _INR(0, 1) | _OUT(2), -1, 12, &yl);
++	scr_w = xl + 1;
++	scr_h = yl + 1;
++	scale = host_setting_int("scale", 0);
++	if (scale <= 0) {     /* the largest that leaves 160 pixels to spare */
++		scale = 1;
++		while (320 * (scale + 1) <= scr_w - 160 && 240 * (scale + 1) <= scr_h - 160)
++			scale++;
++	}
++	if (scale > 8)
++		scale = 8;
++	plat_log("Screen %dx%d, eig %d %d, window scale %d\n", scr_w, scr_h, eigx, eigy, scale);
++}
++
++/* ---- the sprite ---- */
++
++static int sprite_alloc(void)
++{
++	area_size = AREA_HDR + SPR_HDR + 1024 * 512 * 4 + MIN_SPRITE_BYTES + 4096 * 4;
++	area = malloc(area_size);
++	if (area == NULL)
++		return 0;
++	memset(area, 0, area_size);
++	area[0] = (int)area_size;
++	area[1] = 1;
++	area[2] = AREA_HDR;
++	spr_w = spr_h = 0;
++	return 1;
++}
++
++static int *sprite(void)
++{
++	return (int *)((char *)area + AREA_HDR);
++}
++
++static void sprite_set_size(int w, int h)
++{
++	int *s = sprite();
++	int rows = h;
++	size_t bytes;
++	if (w * 4 * rows < MIN_SPRITE_BYTES)
++		rows = (MIN_SPRITE_BYTES + w * 4 - 1) / (w * 4);
++	bytes = SPR_HDR + (size_t)w * 4 * rows;
++	if (AREA_HDR + bytes > area_size) {
++		rows = (int)((area_size - AREA_HDR - SPR_HDR) / (w * 4));
++		bytes = SPR_HDR + (size_t)w * 4 * rows;
++	}
++	s[0] = (int)bytes;
++	memcpy(&s[1], "pcsx\0\0\0\0\0\0\0\0", 12);
++	s[4] = w - 1;                 /* width in words - 1 */
++	s[5] = rows - 1;              /* height in rows - 1 */
++	s[6] = 0;                     /* first bit used */
++	s[7] = 31;                    /* last bit used */
++	s[8] = SPR_HDR;               /* image */
++	s[9] = SPR_HDR;               /* mask = image: no mask */
++	s[10] = (int)0x301680B5;      /* type 6 (32bpp), 90 x 90 dpi */
++	area[3] = AREA_HDR + (int)bytes;
++	spr_w = w;
++	spr_h = h;
++	spr_rows = rows;
++}
++
++static void *frame_buffer(int w, int h, int *pitch)
++{
++	if (w <= 0 || h <= 0 || w > 1024 || h > 512)
++		return NULL;
++	if (w != spr_w || h != spr_h) {
++		int old_h = spr_h, old_w = spr_w;
++		sprite_set_size(w, h);
++		plat_log("Frame %dx%d (was %dx%d)\n", w, h, old_w, old_h);
++		if (win_full >= 0 && fullscreen)
++			_swix(Wimp_ForceRedraw, _INR(0, 4), win_full, -0x10000, -0x10000,
++			      0x10000, 0x10000);
++	}
++	*pitch = w * 4;
++	return (char *)sprite() + SPR_HDR;
++}
++
++/* ---- where the picture goes, in work area OS units ---- */
++
++struct box { int x0, y0, x1, y1; };
++
++static struct box desk_box(void)
++{
++	struct box b;
++	b.x0 = 0;
++	b.x1 = (320 * scale) << eigx;
++	b.y1 = 0;
++	b.y0 = -((240 * scale) << eigy);
++	return b;
++}
++
++static struct box full_box(void)
++{
++	struct box b;
++	int w = scr_w, h = scr_w * 3 / 4;
++	if (h > scr_h) {
++		h = scr_h;
++		w = scr_h * 4 / 3;
++	}
++	if (host_setting_int("fullscreen.integer", 0) && h >= 240) {
++		int k = h / 240;
++		h = 240 * k;
++		w = 320 * k;
++	}
++	b.x0 = ((scr_w - w) / 2) << eigx;
++	b.x1 = b.x0 + (w << eigx);
++	b.y1 = -(((scr_h - h) / 2) << eigy);
++	b.y0 = b.y1 - (h << eigy);
++	return b;
++}
++
++/* Plots the frame at box B of the work area whose origin is at (ox, oy). */
++static void plot(int ox, int oy, struct box b)
++{
++	int scale_block[4];
++	int fw = b.x1 - b.x0, fh = b.y1 - b.y0, sh, top;
++	if (spr_w == 0)
++		return;
++	/* the sprite is 2 OS units a pixel (90 dpi) */
++	scale_block[0] = fw;
++	scale_block[1] = fh;
++	scale_block[2] = spr_w * 2;
++	scale_block[3] = spr_h * 2;
++	/* the whole sprite, unseen rows included, scaled: its bottom edge */
++	sh = (int)(((long long)spr_rows * fh) / spr_h);
++	sh = (sh >> eigy) << eigy;
++	top = oy + b.y1;
++	_swix(OS_SpriteOp, _INR(0, 7), 512 + 52, area, sprite(),
++	      ox + b.x0, top - sh, 0, scale_block, 0);
++}
++
++static struct box current_box(void)
++{
++	return fullscreen ? full_box() : desk_box();
++}
++
++static int current_window(void)
++{
++	return fullscreen ? win_full : win_desk;
++}
++
++static void redraw(int *b)
++{
++	int more = 0;
++	struct box fb = current_box();
++	_swix(Wimp_RedrawWindow, _IN(1) | _OUT(0), b, &more);
++	while (more) {
++		if (host_frame(NULL))
++			plot(b[1] - b[5], b[4] - b[6], fb);
++		_swix(Wimp_GetRectangle, _IN(1) | _OUT(0), b, &more);
++	}
++}
++
++static void present(void)
++{
++	int b[11], more = 0;
++	struct box fb = current_box();
++	unsigned t0 = plat_time_cs();
++	if (closed)
++		return;
++	b[0] = current_window();
++	b[1] = fb.x0;
++	b[2] = fb.y0;
++	b[3] = fb.x1;
++	b[4] = fb.y1;
++	if (_swix(Wimp_UpdateWindow, _IN(1) | _OUT(0), b, &more))
++		return;
++	while (more) {
++		plot(b[1] - b[5], b[4] - b[6], fb);
++		_swix(Wimp_GetRectangle, _IN(1) | _OUT(0), b, &more);
++	}
++	frames_shown++;
++	fps_frames++;
++	show_cs += plat_time_cs() - t0;
++}
++
++/* ---- windows ---- */
++
++static void set_title(void)
++{
++	char fps[24] = "", old[sizeof title];
++	const char *msg = host_message(plat_time_cs());
++	strcpy(old, title);
++	if (log_frames && host_game_loaded() && !paused)
++		snprintf(fps, sizeof fps, "  %d fps", fps_shown);
++	if (!host_game_loaded())
++		snprintf(title, sizeof title, "PCSX: drag a disc image here");
++	else
++		snprintf(title, sizeof title, "PCSX: %s%s%s%s%s", host_game_name(),
++		         paused ? " (paused)" : "", fps, msg ? ": " : "", msg ? msg : "");
++	if (win_desk >= 0 && strcmp(old, title) != 0)
++		_swix(Wimp_ForceRedraw, _INR(0, 2), win_desk, TASK_WORD, 3);   /* title bar */
++}
++
++static int create_window(int full)
++{
++	int b[23], h = -1;
++	memset(b, 0, sizeof b);
++	b[6] = -1;
++	b[7] = full ? (int)0x80000020 : (int)0x87000002;
++	((unsigned char *)b)[32] = 7;   ((unsigned char *)b)[33] = 2;
++	((unsigned char *)b)[34] = 7;   ((unsigned char *)b)[35] = 7;   /* black */
++	((unsigned char *)b)[36] = 3;   ((unsigned char *)b)[37] = 1;
++	((unsigned char *)b)[38] = 12;
++	b[10] = 0; b[11] = -0x4000; b[12] = 0x4000; b[13] = 0;
++	b[14] = full ? 0 : 0x13D;        /* indirected title */
++	b[15] = 3 << 12;                 /* report clicks */
++	b[16] = 1;
++	b[18] = (int)title;
++	b[19] = -1;
++	b[20] = sizeof title;
++	b[21] = 0;
++	if (_swix(Wimp_CreateWindow, _IN(1) | _OUT(0), b, &h))
++		return -1;
++	return h;
++}
++
++static void set_extent(int w, struct box bx)
++{
++	int e[4];
++	e[0] = 0;
++	e[1] = bx.y0 < -(scr_h << eigy) ? bx.y0 : -(scr_h << eigy);
++	e[2] = bx.x1 > (scr_w << eigx) ? bx.x1 : (scr_w << eigx);
++	e[3] = 0;
++	if (w == win_desk) {
++		e[1] = bx.y0;
++		e[2] = bx.x1;
++	}
++	_swix(Wimp_SetExtent, _INR(0, 1), w, e);
++}
++
++static void claim_focus(void)
++{
++	/* invisible caret in our window, so the keys come to us */
++	_swix(Wimp_SetCaretPosition, _INR(0, 5), current_window(), -1, 0, 0, 1 << 25, -1);
++}
++
++static void open_desk(int centre)
++{
++	int b[9];
++	struct box bx = desk_box();
++	int w = bx.x1, h = -bx.y0;
++	set_extent(win_desk, bx);
++	static int opened;
++	b[0] = win_desk;
++	if (centre || !opened || _swix(Wimp_GetWindowState, _IN(1), b)) {
++		b[1] = ((scr_w << eigx) - w) / 2;
++		b[4] = ((scr_h << eigy) + h) / 2;
++	}
++	opened = 1;
++	/* keep the top left corner where it was */
++	b[2] = b[4] - h;
++	b[3] = b[1] + w;
++	b[5] = 0;
++	b[6] = 0;
++	b[7] = -1;
++	_swix(Wimp_OpenWindow, _IN(1), b);
++}
++
++static void open_full(void)
++{
++	int b[9];
++	set_extent(win_full, full_box());
++	b[0] = win_full;
++	b[1] = 0;
++	b[2] = 0;
++	b[3] = scr_w << eigx;
++	b[4] = scr_h << eigy;
++	b[5] = 0;
++	b[6] = 0;
++	b[7] = -1;
++	_swix(Wimp_OpenWindow, _IN(1), b);
++}
++
++static void close_window(int w)
++{
++	int b[1];
++	b[0] = w;
++	_swix(Wimp_CloseWindow, _IN(1), b);
++}
++
++static void set_paused(int p)
++{
++	if (paused == p)
++		return;
++	paused = p;
++	plat_audio_pause(paused || closed);
++	frames_due_done = 0;
++	t_due0 = plat_time_cs();
++	set_title();
++}
++
++static void show(int full)
++{
++	if (full) {
++		close_window(win_desk);
++		fullscreen = 1;
++		open_full();
++	} else {
++		if (fullscreen)
++			close_window(win_full);
++		fullscreen = 0;
++		open_desk(0);
++	}
++	closed = 0;
++	plat_audio_pause(paused);
++	claim_focus();
++	set_title();
++}
++
++/* ---- menus (built in code; every item's text indirected) ---- */
++
++struct menu_item { int flags, submenu, icon_flags; int data[3]; };
++struct menu {
++	char title[12];
++	unsigned char colours[4];
++	int width, height, gap;
++	struct menu_item item[12];
++};
++
++#define ITEM_TICK 1
++#define ITEM_DOTTED 2
++#define ITEM_LAST 0x80
++#define ICON_SHADED (1 << 22)
++
++static struct menu m_icon, m_win, m_scale, m_slot, m_info;
++static char m_text[48][32];
++static int m_ntext;
++static struct menu *open_menu;
++
++static void menu_init(struct menu *m, const char *t)
++{
++	memset(m, 0, sizeof *m);
++	strncpy(m->title, t, sizeof m->title);
++	m->colours[0] = 7; m->colours[1] = 2; m->colours[2] = 7; m->colours[3] = 0;
++	m->width = 16 * 12;
++	m->height = 44;
++	m->gap = 0;
++}
++
++static void menu_add(struct menu *m, int i, const char *text, int flags, void *sub)
++{
++	char *t = m_text[m_ntext++];
++	int w;
++	snprintf(t, 32, "%s", text);
++	m->item[i].flags = flags;
++	m->item[i].submenu = sub ? (int)sub : -1;
++	m->item[i].icon_flags = 0x07000121;   /* text, filled, indirected, black on white */
++	m->item[i].data[0] = (int)t;
++	m->item[i].data[1] = -1;
++	m->item[i].data[2] = 32;
++	if (i > 0)
++		m->item[i - 1].flags &= ~ITEM_LAST;
++	m->item[i].flags |= ITEM_LAST;
++	w = (int)strlen(t) * 16 + 16;
++	if (w > m->width)
++		m->width = w;
++}
++
++static void build_menus(void)
++{
++	int i;
++	char t[32];
++	m_ntext = 0;
++
++	menu_init(&m_info, "About");
++	menu_add(&m_info, 0, "PCSX ReARMed", 0, NULL);
++	menu_add(&m_info, 1, ROFE_VERSION, 0, NULL);
++	menu_add(&m_info, 2, "GPL v2 or later", 0, NULL);
++	for (i = 0; i < 3; i++)
++		m_info.item[i].icon_flags |= ICON_SHADED;
++
++	menu_init(&m_icon, APP);
++	menu_add(&m_icon, 0, "Info", 0, &m_info);
++	menu_add(&m_icon, 1, "Help...", 0, NULL);
++	menu_add(&m_icon, 2, "Choices...", 0, NULL);
++	menu_add(&m_icon, 3, "Reload choices", 0, NULL);
++	menu_add(&m_icon, 4, "Log...", ITEM_DOTTED, NULL);
++	menu_add(&m_icon, 5, "Quit", 0, NULL);
++
++	menu_init(&m_scale, "Scale");
++	for (i = 1; i <= 6; i++) {
++		snprintf(t, sizeof t, "%d x (%dx%d)", i, 320 * i, 240 * i);
++		menu_add(&m_scale, i - 1, t, i == scale ? ITEM_TICK : 0, NULL);
++	}
++	menu_init(&m_slot, "Slot");
++	for (i = 0; i < 10; i++) {
++		snprintf(t, sizeof t, "%d", i);
++		menu_add(&m_slot, i, t, i == state_slot ? ITEM_TICK : 0, NULL);
++	}
++
++	menu_init(&m_win, APP);
++	menu_add(&m_win, 0, "Pause      F8", paused ? ITEM_TICK : 0, NULL);
++	menu_add(&m_win, 1, "Reset", 0, NULL);
++	menu_add(&m_win, 2, "Full screen F11", (fullscreen ? ITEM_TICK : 0) | ITEM_DOTTED, NULL);
++	menu_add(&m_win, 3, "Scale", 0, &m_scale);
++	menu_add(&m_win, 4, "Save state  F2", 0, NULL);
++	menu_add(&m_win, 5, "Load state  F4", 0, NULL);
++	menu_add(&m_win, 6, "State slot", ITEM_DOTTED, &m_slot);
++	menu_add(&m_win, 7, "Close game", 0, NULL);
++	menu_add(&m_win, 8, "Quit", 0, NULL);
++	if (!host_game_loaded())
++		for (i = 0; i < 8; i++)
++			if (i != 2 && i != 3)
++				m_win.item[i].icon_flags |= ICON_SHADED;
++}
++
++static void show_menu(struct menu *m, int x, int y)
++{
++	build_menus();
++	open_menu = m;
++	_swix(Wimp_CreateMenu, _INR(1, 3), m, x, y);
++}
++
++static void start_task(const char *cmd)
++{
++	_swix(Wimp_StartTask, _IN(0), cmd);
++}
++
++/* ---- games ---- */
++
++static void load_game(const char *unix_path)
++{
++	if (!host_load_game(unix_path)) {
++		char msg[300];
++		snprintf(msg, sizeof msg, "PCSX couldn't load %s (see the log)", unix_path);
++		report(msg);
++	}
++	{
++		int rate = host_audio_rate();
++		int ms = host_setting_int("audio.latency", 80);
++		if (ms < 30) ms = 30;
++		if (ms > 500) ms = 500;
++		audio_target = rate * 4 * ms / 1000;
++	}
++	paused = 0;
++	t_due0 = plat_time_cs();
++	frames_due_done = 0;
++	show(fullscreen || host_setting_int("fullscreen", 0));
++}
++
++static void load_ro_path(const char *ro_path)
++{
++	char unix_path[1024];
++	if (__unixify_std(ro_path, unix_path, sizeof unix_path, 0) == NULL) {
++		report("PCSX couldn't make sense of that file's name");
++		return;
++	}
++	plat_log("Dropped %s -> %s\n", ro_path, unix_path);
++	load_game(unix_path);
++}
++
++static void reload_choices(void)
++{
++	choices_clear();
++	choices_load("/<PCSX$Dir>/Resources/Choices");
++	choices_load("/<Choices$Write>/PCSX/Choices");
++	host_reload_choices();
++}
++
++/* ---- running ---- */
++
++static int have_focus(void)
++{
++	int b[6];
++	if (_swix(Wimp_GetCaretPosition, _IN(1), b))
++		return 0;
++	return b[0] == win_desk || b[0] == win_full;
++}
++
++static void stats(unsigned now)
++{
++	if (!log_frames || (int)(now - t_stats) < 500)
++		return;
++	if (frames_run)
++		plat_log("Frames: %u run (%.1f ms each), %u shown (%.1f ms each), sound queued %d\n",
++		         frames_run, run_cs * 10.0 / frames_run, frames_shown,
++		         frames_shown ? show_cs * 10.0 / frames_shown : 0.0,
++		         plat_audio_queued());
++	frames_run = frames_shown = run_cs = show_cs = 0;
++	t_stats = now;
++}
++
++/* Runs the frames that are due; returns how many. */
++static int run_frames(void)
++{
++	unsigned t0 = plat_time_cs();
++	int n = 0, focus = have_focus() || fullscreen;
++	int q = host_audio_rate() ? plat_audio_queued() : -1;
++	int newf = 0;
++
++	if (q >= 0) {
++		while (q < audio_target && n < 4) {
++			host_run_frame(focus);
++			n++;
++			q = plat_audio_queued();
++			if (q < 0)
++				break;
++		}
++	} else {
++		double due = (double)(t0 - t_due0) * host_fps() / 100.0 - frames_due_done;
++		if (due > 8) {           /* far behind (or just started): catch up no more */
++			frames_due_done += due - 1;
++			due = 1;
++		}
++		while (due >= 1 && n < 4) {
++			host_run_frame(focus);
++			n++;
++			due -= 1;
++			frames_due_done += 1;
++		}
++	}
++	if (n) {
++		frames_run += n;
++		run_cs += plat_time_cs() - t0;
++		host_frame(&newf);
++		if (newf)
++			present();
++	}
++	return n;
++}
++
++/* ---- events ---- */
++
++static int quit;
++
++static void message(int *b, int reason)
++{
++	switch (b[4]) {
++	case Message_Quit:
++		quit = 1;
++		break;
++	case Message_DataLoad:
++		if (b[5] == win_desk || b[5] == win_full || b[5] == -2) {
++			char path[256];
++			snprintf(path, sizeof path, "%s", (char *)&b[11]);
++			b[3] = b[2];
++			b[4] = Message_DataLoadAck;
++			_swix(Wimp_SendMessage, _INR(0, 2), 17, b, b[1]);
++			load_ro_path(path);
++		}
++		break;
++	case Message_ModeChange:
++		read_mode();
++		if (!closed)
++			show(fullscreen);
++		break;
++	case Message_PreQuit:
++		host_flush_saves();
++		break;
++	}
++	(void)reason;
++}
++
++static void key(int code)
++{
++	int alt = plat_key_down(2);
++	if (code == KEY_F11 || (code == 13 && alt)) {
++		show(!fullscreen);
++		return;
++	}
++	if (code == 0x1B && fullscreen) {
++		show(0);
++		return;
++	}
++	if (host_game_loaded()) {
++		switch (code) {
++		case KEY_F(2):
++			host_save_state(state_slot);
++			return;
++		case KEY_F(4):
++			host_load_state(state_slot);
++			return;
++		case KEY_F(6):
++			state_slot = (state_slot + 9) % 10;
++			plat_log("State slot %d\n", state_slot);
++			return;
++		case KEY_F(7):
++			state_slot = (state_slot + 1) % 10;
++			plat_log("State slot %d\n", state_slot);
++			return;
++		case KEY_F(8):
++			set_paused(!paused);
++			return;
++		}
++	}
++	_swix(Wimp_ProcessKey, _IN(0), code);
++}
++
++static void menu_select(int *sel)
++{
++	int ptr[5];
++	struct menu *m = open_menu;
++
++	if (m == &m_icon) {
++		switch (sel[0]) {
++		case 1: start_task("Filer_Run <PCSX$Dir>.!Help"); break;
++		case 2: start_task("Filer_Run <Choices$Write>.PCSX.Choices"); break;
++		case 3: reload_choices(); read_mode(); if (!closed) show(fullscreen); break;
++		case 4: if (log_frames) start_task("Filer_Run <Wimp$ScrapDir>.pcsxlog"); break;
++		case 5: quit = 1; break;
++		}
++	} else if (m == &m_win) {
++		switch (sel[0]) {
++		case 0: set_paused(!paused); break;
++		case 1: host_reset(); break;
++		case 2: show(!fullscreen); break;
++		case 3:
++			if (sel[1] >= 0) {
++				scale = sel[1] + 1;
++				if (!fullscreen)
++					open_desk(0);
++			}
++			break;
++		case 4: host_save_state(state_slot); break;
++		case 5: host_load_state(state_slot); break;
++		case 6:
++			if (sel[1] >= 0)
++				state_slot = sel[1];
++			break;
++		case 7:
++			host_unload_game();
++			set_title();
++			_swix(Wimp_ForceRedraw, _INR(0, 4), current_window(), -0x10000, -0x10000,
++			      0x10000, 0x10000);
++			break;
++		case 8: quit = 1; break;
++		}
++	}
++	/* Adjust keeps the menu open */
++	if (!quit && _swix(Wimp_GetPointerInfo, _IN(1), ptr) == NULL && (ptr[2] & 1)) {
++		build_menus();
++		_swix(Wimp_CreateMenu, _INR(1, 3), m, 0, 0);
++		_swix(Wimp_CreateMenu, _INR(1, 3), m, ptr[0] - 64, ptr[1]);
++	}
++}
++
++static void event(int reason, int *b)
++{
++	switch (reason) {
++	case 0:          /* null */
++		break;
++	case 1:          /* redraw */
++		redraw(b);
++		break;
++	case 2:          /* open */
++		_swix(Wimp_OpenWindow, _IN(1), b);
++		break;
++	case 3:          /* close */
++		close_window(b[0]);
++		if (b[0] == win_full)
++			show(0);
++		else {
++			closed = 1;
++			plat_audio_pause(1);
++		}
++		break;
++	case 6:          /* mouse click */
++		if (b[3] == -2) {
++			if (b[2] == 2)
++				show_menu(&m_icon, b[0] - 64, 96 + 44 * 6);
++			else if (b[2] == 4 || b[2] == 1)
++				show(fullscreen);
++		} else if (b[3] == win_desk || b[3] == win_full) {
++			if (b[2] == 2)
++				show_menu(&m_win, b[0] - 64, b[1]);
++			else
++				claim_focus();
++		}
++		break;
++	case 8:          /* key */
++		key(b[6]);
++		break;
++	case 9:          /* menu selection */
++		menu_select(b);
++		break;
++	case 17:
++	case 18:
++		message(b, reason);
++		break;
++	}
++}
++
++/* ---- start and finish ---- */
++
++static void redirect_log(void)
++{
++	const char *log = getenv("PCSX$Log");
++	if (log && *log && strcmp(log, "off") != 0) {
++		if (freopen(log, "w", stderr) == NULL)
++			freopen("/dev/null", "w", stderr);
++	} else
++		freopen("/dev/null", "w", stderr);
++	freopen("/dev/null", "w", stdout);
++	dup2(fileno(stderr), 1);
++}
++
++int main(int argc, char **argv)
++{
++	static const int messages[] = {
++		Message_DataLoad, Message_PreQuit, Message_ModeChange, 0
++	};
++	static int b[64];
++	int reason, idle = 0;
++
++	redirect_log();
++	log_frames = getenv("PCSX$Log") != NULL && strcmp(getenv("PCSX$Log"), "off") != 0;
++	plat_log("PCSX ReARMed %s for RISC OS\n", ROFE_VERSION);
++
++	choices_clear();
++	if (!choices_load("/<PCSX$Dir>/Resources/Choices"))
++		plat_log("No default Choices in !PCSX.Resources\n");
++	if (choices_load("/<Choices$Write>/PCSX/Choices"))
++		plat_log("Choices from <Choices$Write>.PCSX.Choices\n");
++
++	if (_swix(Wimp_Initialise, _INR(0, 3) | _OUT(1), 380, TASK_WORD, APP, messages, &task))
++		return 1;
++	if (!sprite_alloc()) {
++		report("PCSX hasn't enough memory for its picture");
++		return 1;
++	}
++	read_mode();
++	win_desk = create_window(0);
++	win_full = create_window(1);
++	{
++		int ib[9];
++		memset(ib, 0, sizeof ib);
++		ib[0] = -1;
++		ib[3] = 68;
++		ib[4] = 68;
++		ib[5] = 0x301A;
++		memcpy(&ib[6], "!pcsx", 6);
++		_swix(Wimp_CreateIcon, _INR(0, 1), 0, ib);
++	}
++	closed = 1;
++	set_title();
++
++	host_init("/<Choices$Write>/PCSX/bios", "/<Choices$Write>/PCSX/saves",
++	          "/<Choices$Write>/PCSX/states", frame_buffer);
++
++	if (argc > 1 && argv[1][0])
++		load_ro_path(argv[1]);
++
++	t_stats = t_title = t_flush = plat_time_cs();
++	while (!quit) {
++		int running = host_game_loaded() && !paused && !closed;
++		unsigned now = plat_time_cs();
++		_kernel_oserror *e;
++		if (running)
++			e = _swix(Wimp_PollIdle, _INR(0, 2) | _OUT(0), 0, b,
++			          now + (idle ? 1 : 0), &reason);
++		else
++			e = _swix(Wimp_Poll, _INR(0, 1) | _OUT(0), 1, b, &reason);
++		if (e) {
++			report(e->errmess);
++			break;
++		}
++		event(reason, b);
++		if (reason == 0 && running) {
++			now = plat_time_cs();
++			idle = run_frames() == 0;
++			stats(now);
++		}
++		now = plat_time_cs();
++		if ((int)(now - t_title) >= 100) {
++			fps_shown = (int)(fps_frames * 100 / (now - t_title));
++			fps_frames = 0;
++			t_title = now;
++			if (!closed)
++				set_title();
++		}
++		if ((int)(now - t_flush) >= 1000) {   /* memory cards every 10 s */
++			host_flush_saves();
++			t_flush = now;
++		}
++	}
++	host_shutdown();
++	_swix(Wimp_CloseDown, _INR(0, 1), task, TASK_WORD);
++	plat_log("Bye\n");
++	return 0;
++}
+-- 
+2.43.0
+

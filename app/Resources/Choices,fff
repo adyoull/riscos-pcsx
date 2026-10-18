@@ -1,0 +1,80 @@
+# !PCSX default settings. Don't edit this file: put your own settings in
+# <Choices$Write>.PCSX.Choices (the icon bar menu's "Choices..." opens it),
+# which is read after this one, so a setting there wins.
+# Lines are "name: value"; # starts a comment.
+
+# --- Window -----------------------------------------------------------
+# scale: 0 = the largest that fits the screen (with 160 pixels to spare),
+# or 1-6 (the window is 320 x 240 times this, in screen pixels).
+scale: 0
+# fullscreen: 1 = start games full screen (F11 or Alt-Return toggles).
+fullscreen: 0
+# fullscreen.integer: 1 = only whole multiples of 320 x 240 full screen.
+fullscreen.integer: 0
+
+# --- Sound ------------------------------------------------------------
+sound: 1
+# audio.latency: how much sound to keep queued, in milliseconds (30-500).
+# More copes better with a busy desktop; less is more immediate.
+audio.latency: 80
+
+# --- Keyboard (player 1) ----------------------------------------------
+# Key names: A-Z, 0-9, F1-F12, Up, Down, Left, Right, Return, Space, Tab,
+# Shift, LShift, RShift, Ctrl, LCtrl, RCtrl, Alt, Backspace, Delete,
+# Insert, Home, End, PageUp, PageDown, Keypad0-Keypad9, KeypadEnter,
+# Comma, Dot, Slash, Semicolon, Quote, Minus, Equals, ... or none.
+pad1.up: Up
+pad1.down: Down
+pad1.left: Left
+pad1.right: Right
+pad1.cross: Z
+pad1.circle: X
+pad1.square: A
+pad1.triangle: S
+pad1.l1: Q
+pad1.r1: W
+pad1.l2: 1
+pad1.r2: 2
+pad1.l3: 3
+pad1.r3: 4
+pad1.start: Return
+pad1.select: RShift
+# Player 2 has no keys unless you give some (pad2.cross: ... etc).
+
+# --- Controllers --------------------------------------------------------
+# pad1.type, pad2.type: standard, analog, dualshock or none.
+pad1.type: standard
+pad2.type: standard
+
+# --- Joysticks (USBJoystick) ------------------------------------------
+# The first two pads found are players 1 and 2. A hat or D-pad is the
+# PlayStation D-pad; without one the left stick is (on a standard pad).
+# joy.buttons maps the pad's button numbers (0 = first) to PlayStation
+# buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 select start.
+# joy.log: 1 = log each button press with its number, to find them.
+joy.buttons: 0=cross 1=circle 2=square 3=triangle 4=l1 5=r1 6=l2 7=r2 8=select 9=start 10=l3 11=r3
+joy.deadzone: 25
+joy.log: 0
+
+# --- Emulation (PCSX ReARMed's own options) ---------------------------
+# pcsx_rearmed_drc: enabled = dynamic recompiler (fast); disabled =
+# interpreter (slow; try it if a game misbehaves).
+pcsx_rearmed_drc: enabled
+# pcsx_rearmed_bios: auto = a real BIOS from <Choices$Write>.PCSX.bios if
+# there is one (scph1001/bin, scph5501/bin, ...), else the built-in
+# HLE BIOS; HLE = always the built-in one.
+pcsx_rearmed_bios: auto
+# pcsx_rearmed_region: auto, NTSC or PAL.
+pcsx_rearmed_region: auto
+# pcsx_rearmed_memcard1: shared (one card for every game, saves.pcsx-card1/mcd),
+# serial (a card per game), libretro (saves.<game>/srm) or none.
+pcsx_rearmed_memcard1: shared
+# pcsx_rearmed_frameskip_type: disabled, auto, auto_threshold or fixed_interval.
+pcsx_rearmed_frameskip_type: disabled
+# pcsx_rearmed_neon_enhancement_enable: enabled = render at twice the
+# resolution (sharper 3D, much slower).
+pcsx_rearmed_neon_enhancement_enable: disabled
+# pcsx_rearmed_spu_interpolation: simple, gaussian, cubic or off.
+pcsx_rearmed_spu_interpolation: simple
+# Every other pcsx_rearmed_* option the core has can be set here too;
+# the log lists them all with their current values.

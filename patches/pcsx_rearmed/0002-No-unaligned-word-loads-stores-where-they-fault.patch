@@ -1,0 +1,68 @@
+From 0832554c6d51bbe383751986bcf390d481b40f36 Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:00:00 +0100
+Subject: [PATCH 2/5] No unaligned word loads/stores where they fault
+
+new_dynarec: get_reg's assembler version loads regmap (not word
+aligned in struct regstat) as words: use the C version unless
+__ARM_FEATURE_UNALIGNED. gpu_neon: the right edge of untextured flat
+spans was stored as words to 2-byte aligned VRAM: halfwords instead.
+---
+ libpcsxcore/new_dynarec/new_dynarec.c       |  5 ++++-
+ plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.S | 17 +++++++++++++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/libpcsxcore/new_dynarec/new_dynarec.c b/libpcsxcore/new_dynarec/new_dynarec.c
+index fb99df6e..283d493a 100644
+--- a/libpcsxcore/new_dynarec/new_dynarec.c
++++ b/libpcsxcore/new_dynarec/new_dynarec.c
+@@ -1146,7 +1146,10 @@ static void clear_all_regs(signed char regmap[])
+ 
+ // get_reg: get allocated host reg from mips reg
+ // returns -1 if no such mips reg was allocated
+-#if defined(__arm__) && defined(HAVE_ARMV6) && HOST_REGS == 13 && EXCLUDE_REG == 11
++// (the assembler version loads regmap as words, and regmap isn't word
++// aligned in struct regstat: not where unaligned loads fault, as on RISC OS)
++#if defined(__arm__) && defined(HAVE_ARMV6) && HOST_REGS == 13 && EXCLUDE_REG == 11 \
++    && defined(__ARM_FEATURE_UNALIGNED)
+ 
+ extern signed char get_reg(const signed char regmap[], signed char r);
+ 
+diff --git a/plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.S b/plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.S
+index e416208a..990c96b3 100644
+--- a/plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.S
++++ b/plugins/gpu_neon/psx_gpu/psx_gpu_arm_neon.S
+@@ -2050,6 +2050,7 @@ function(setup_blocks_unshaded_untextured_undithered_unswizzled_direct)
+   cmp right_mask, #0x0
+   beq 5f
+ 
++#ifdef __ARM_FEATURE_UNALIGNED
+   tst right_mask, #0xF
+   streq color, [fb_ptr], #4
+   moveq right_mask, right_mask, lsr #4
+@@ -2058,6 +2059,22 @@ function(setup_blocks_unshaded_untextured_undithered_unswizzled_direct)
+   tst right_mask, #0x3
+   streq color, [fb_ptr], #4
+   moveq right_mask, right_mask, lsr #2
++#else
++  @ fb_ptr is only 2-byte aligned, which a word store needs where
++  @ unaligned access faults (RISC OS): two halfwords (color has the
++  @ same pixel in both)
++  tst right_mask, #0xF
++  strheq color, [fb_ptr], #2
++  strheq color, [fb_ptr], #2
++  moveq right_mask, right_mask, lsr #4
++  strheq color, [fb_ptr], #2
++  strheq color, [fb_ptr], #2
++
++  tst right_mask, #0x3
++  strheq color, [fb_ptr], #2
++  strheq color, [fb_ptr], #2
++  moveq right_mask, right_mask, lsr #2
++#endif
+ 
+   tst right_mask, #0x1
+   strheq color, [fb_ptr]
+-- 
+2.43.0
+

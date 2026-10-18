@@ -1,0 +1,36 @@
+From c7bc2b4c30ef2afe3677d067d87e2d1433a3fc86 Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:00:00 +0100
+Subject: [PATCH 4/5] RISC OS: .cue files naming files with spaces
+
+RISC OS filing systems hold a space in a name as a hard space (0xA0):
+try that when the name in the .cue isn't found.
+---
+ libpcsxcore/cdriso.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/libpcsxcore/cdriso.c b/libpcsxcore/cdriso.c
+index c563da80..c14b7f9c 100644
+--- a/libpcsxcore/cdriso.c
++++ b/libpcsxcore/cdriso.c
+@@ -488,6 +488,17 @@ static int parsecue(const char *isofile) {
+ 				strncpy(incue_fname, tmp, incue_max_len);
+ 				ti[numtracks + 1].handle = fopen(filepath, "rb");
+ 			}
++#ifdef __riscos__
++			// RISC OS filing systems keep a space in a file name as a
++			// hard space (0xA0), as DOSFS shows a PC file's name
++			if (ti[numtracks + 1].handle == NULL && strchr(incue_fname, ' ')) {
++				char *sp;
++				for (sp = incue_fname; *sp; sp++)
++					if (*sp == ' ')
++						*sp = (char)0xA0;
++				ti[numtracks + 1].handle = fopen(filepath, "rb");
++			}
++#endif
+ 			if (ti[numtracks + 1].handle == NULL) {
+ 				SysPrintf(_("\ncould not open: %s\n"), filepath);
+ 				continue;
+-- 
+2.43.0
+

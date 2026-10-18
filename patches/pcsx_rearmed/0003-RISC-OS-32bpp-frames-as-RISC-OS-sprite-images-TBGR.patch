@@ -1,0 +1,198 @@
+From 510f5aadedbed4044b4faf9bd160e9e3f34b06ad Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:00:00 +0100
+Subject: [PATCH 3/5] RISC OS: 32bpp frames as RISC OS sprite images (TBGR)
+
+The frontend draws frames as a 32bpp sprite: red in the low byte.
+With ROFE_TBGR (or on RISC OS) the XRGB8888 converters write that
+order instead (NEON for the full-width ones).
+---
+ frontend/libretro.c             |   9 +++
+ frontend/riscos/cspace_riscos.c | 126 ++++++++++++++++++++++++++++++++
+ frontend/riscos/cspace_riscos.h |  12 +++
+ 3 files changed, 147 insertions(+)
+ create mode 100644 frontend/riscos/cspace_riscos.c
+ create mode 100644 frontend/riscos/cspace_riscos.h
+
+diff --git a/frontend/libretro.c b/frontend/libretro.c
+index 9dd3502c..85e5f236 100644
+--- a/frontend/libretro.c
++++ b/frontend/libretro.c
+@@ -42,6 +42,9 @@
+ #include "../plugins/dfsound/out.h"
+ #include "../plugins/dfsound/spu_config.h"
+ #include "cspace.h"
++#if defined(__riscos__) || defined(ROFE_TBGR)
++#include "riscos/cspace_riscos.h"
++#endif
+ #include "main.h"
+ #include "menu.h"
+ #include "plugin.h"
+@@ -277,8 +280,14 @@ static const struct cspace_func_type {
+ } cspace_funcs[] = {
+    { bgr555_to_rgb565,   bgr555_to_rgb565_640_to_320,   bgr555_to_rgb565_512_to_320 },
+    { bgr888_to_rgb565,   bgr888_to_rgb565_640_to_320,   bgr888_to_rgb565_512_to_320 },
++#if defined(__riscos__) || defined(ROFE_TBGR)
++   /* RISC OS: "XRGB8888" frames are RISC OS 32bpp sprite images (TBGR) */
++   { riscos_bgr555_to_tbgr, riscos_bgr555_to_tbgr_640_to_320, riscos_bgr555_to_tbgr_512_to_320 },
++   { riscos_bgr888_to_tbgr, riscos_bgr888_to_tbgr_640_to_320, riscos_bgr888_to_tbgr_512_to_320 },
++#else
+    { bgr555_to_xrgb8888, bgr555_to_xrgb8888_640_to_320, bgr555_to_xrgb8888_512_to_320 },
+    { bgr888_to_xrgb8888, bgr888_to_xrgb8888_640_to_320, bgr888_to_xrgb8888_512_to_320 },
++#endif
+ };
+ 
+ static void set_bgr_to_fb_func(int bgr24)
+diff --git a/frontend/riscos/cspace_riscos.c b/frontend/riscos/cspace_riscos.c
+new file mode 100644
+index 00000000..912d0f93
+--- /dev/null
++++ b/frontend/riscos/cspace_riscos.c
+@@ -0,0 +1,126 @@
++/*
++ * Colour conversion for the RISC OS frontend.
++ *
++ * The frontend asks the core for RETRO_PIXEL_FORMAT_XRGB8888, but what it
++ * hands the core is the image of a RISC OS 32bpp sprite (type 6, TBGR):
++ * in memory each pixel is R, G, B, 0, red in the low byte. So on RISC OS
++ * libretro.c uses these instead of bgr555_to_xrgb8888 and friends, and the
++ * frame goes to the screen with no further conversion.
++ *
++ * PSX 15-bit pixels are 0BBBBBGGGGGRRRRR; 24-bit ones are bytes R, G, B.
++ * Every pointer here is only as aligned as its element (2 bytes for VRAM),
++ * which is all RISC OS's alignment checking needs: the NEON loads and
++ * stores below are element-sized (vld1.16, vst4.8).
++ *
++ * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
++ */
++#include <stdint.h>
++#include "cspace_riscos.h"
++
++#if defined(__ARM_NEON__) || defined(__ARM_NEON)
++#include <arm_neon.h>
++#define HAVE_NEON_INTRINSICS 1
++#endif
++
++static inline uint32_t one555(uint16_t p)
++{
++	uint32_t r = p & 0x1f, g = (p >> 5) & 0x1f, b = (p >> 10) & 0x1f;
++	r = (r << 3) | (r >> 2);
++	g = (g << 3) | (g >> 2);
++	b = (b << 3) | (b >> 2);
++	return r | (g << 8) | (b << 16);
++}
++
++static inline uint32_t one888(const uint8_t *s)
++{
++	return s[0] | (s[1] << 8) | (s[2] << 16);
++}
++
++void riscos_bgr555_to_tbgr(void *dst_, const void *src_, int pixels)
++{
++	const uint16_t *src = src_;
++	uint32_t *dst = dst_;
++#ifdef HAVE_NEON_INTRINSICS
++	const uint16x8_t m = vdupq_n_u16(0x1f);
++	for (; pixels >= 8; pixels -= 8, src += 8, dst += 8) {
++		uint16x8_t p = vld1q_u16(src);
++		uint16x8_t r = vandq_u16(p, m);
++		uint16x8_t g = vandq_u16(vshrq_n_u16(p, 5), m);
++		uint16x8_t b = vandq_u16(vshrq_n_u16(p, 10), m);
++		uint8x8x4_t o;
++		/* x5 -> x8: (x << 3) | (x >> 2) */
++		o.val[0] = vmovn_u16(vorrq_u16(vshlq_n_u16(r, 3), vshrq_n_u16(r, 2)));
++		o.val[1] = vmovn_u16(vorrq_u16(vshlq_n_u16(g, 3), vshrq_n_u16(g, 2)));
++		o.val[2] = vmovn_u16(vorrq_u16(vshlq_n_u16(b, 3), vshrq_n_u16(b, 2)));
++		o.val[3] = vdup_n_u8(0);
++		vst4_u8((uint8_t *)dst, o);
++	}
++#endif
++	for (; pixels > 0; pixels--)
++		*dst++ = one555(*src++);
++}
++
++void riscos_bgr888_to_tbgr(void *dst_, const void *src_, int pixels)
++{
++	const uint8_t *src = src_;
++	uint32_t *dst = dst_;
++#ifdef HAVE_NEON_INTRINSICS
++	for (; pixels >= 8; pixels -= 8, src += 24, dst += 8) {
++		uint8x8x3_t p = vld3_u8(src);
++		uint8x8x4_t o;
++		o.val[0] = p.val[0];
++		o.val[1] = p.val[1];
++		o.val[2] = p.val[2];
++		o.val[3] = vdup_n_u8(0);
++		vst4_u8((uint8_t *)dst, o);
++	}
++#endif
++	for (; pixels > 0; pixels--, src += 3)
++		*dst++ = one888(src);
++}
++
++/* Halving (640 or 512 wide -> 320), for the core's "scale hires" option. */
++void riscos_bgr555_to_tbgr_640_to_320(void *dst_, const void *src_, int dpixels)
++{
++	const uint16_t *src = src_;
++	uint32_t *dst = dst_;
++	for (; dpixels > 0; dpixels--, src += 2)
++		*dst++ = one555(*src);
++}
++
++void riscos_bgr888_to_tbgr_640_to_320(void *dst_, const void *src_, int dpixels)
++{
++	const uint8_t *src = src_;
++	uint32_t *dst = dst_;
++	for (; dpixels > 0; dpixels--, src += 6)
++		*dst++ = one888(src);
++}
++
++/* 512 -> 320: 8 source pixels to 5, as cspace.c does it. */
++void riscos_bgr555_to_tbgr_512_to_320(void *dst_, const void *src_, int dpixels)
++{
++	static const unsigned char pick[5] = { 0, 2, 4, 5, 7 };
++	const uint16_t *src = src_;
++	uint32_t *dst = dst_;
++	for (; dpixels >= 5; dpixels -= 5, src += 8) {
++		int i;
++		for (i = 0; i < 5; i++)
++			*dst++ = one555(src[pick[i]]);
++	}
++	for (; dpixels > 0; dpixels--, src++)
++		*dst++ = one555(*src);
++}
++
++void riscos_bgr888_to_tbgr_512_to_320(void *dst_, const void *src_, int dpixels)
++{
++	static const unsigned char pick[5] = { 0, 2, 4, 5, 7 };
++	const uint8_t *src = src_;
++	uint32_t *dst = dst_;
++	for (; dpixels >= 5; dpixels -= 5, src += 8 * 3) {
++		int i;
++		for (i = 0; i < 5; i++)
++			*dst++ = one888(src + pick[i] * 3);
++	}
++	for (; dpixels > 0; dpixels--, src += 3)
++		*dst++ = one888(src);
++}
+diff --git a/frontend/riscos/cspace_riscos.h b/frontend/riscos/cspace_riscos.h
+new file mode 100644
+index 00000000..4f7a9e11
+--- /dev/null
++++ b/frontend/riscos/cspace_riscos.h
+@@ -0,0 +1,12 @@
++/* Colour conversion into RISC OS 32bpp (TBGR) sprite images. See the .c. */
++#ifndef CSPACE_RISCOS_H
++#define CSPACE_RISCOS_H
++
++void riscos_bgr555_to_tbgr(void *dst, const void *src, int pixels);
++void riscos_bgr888_to_tbgr(void *dst, const void *src, int pixels);
++void riscos_bgr555_to_tbgr_640_to_320(void *dst, const void *src, int dpixels);
++void riscos_bgr888_to_tbgr_640_to_320(void *dst, const void *src, int dpixels);
++void riscos_bgr555_to_tbgr_512_to_320(void *dst, const void *src, int dpixels);
++void riscos_bgr888_to_tbgr_512_to_320(void *dst, const void *src, int dpixels);
++
++#endif
+-- 
+2.43.0
+

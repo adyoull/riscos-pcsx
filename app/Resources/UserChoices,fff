@@ -1,0 +1,13 @@
+# Your !PCSX settings. These win over !PCSX.Resources.Choices, which has
+# every setting with what it does. Remove the # from a line to use it,
+# then choose "Reload choices" from the icon bar menu (or restart PCSX).
+#
+# scale: 2
+# fullscreen: 1
+# audio.latency: 120
+# pad1.cross: Space
+# pad1.type: dualshock
+# joy.buttons: 1=cross 2=circle 0=square 3=triangle 4=l1 5=r1 6=l2 7=r2 8=select 9=start
+# joy.log: 1
+# pcsx_rearmed_bios: HLE
+# pcsx_rearmed_drc: disabled
