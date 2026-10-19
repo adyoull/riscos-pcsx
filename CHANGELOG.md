@@ -1,5 +1,20 @@
 # Changelog
 
+## r26-riscos1 (2026-10-19): first release
+The riscos7test program, with the log off (take the | off "Set
+PCSX$LogOn 1" in !Run for one) and !Help no longer calling it a test
+build. What's in it: PCSX ReARMed r26 (upstream 8b6c1635) with its ARM
+dynamic recompiler and NEON GPU; a native desktop frontend (window and
+full screen, sound through SharedSoundBuffer, keyboard and !USBJoystick
+pads); the games library (folders, recently played, covers, per-game
+settings); games in .zip and .7z files.
+
+Confirmed on a Pi 4: the dynarec, picture and sound (Rally Championship,
+cue/bin with CD audio, 50 fps), the test programs, playing from zips
+inside SparkFS, unpacking and playing a CloneCD rip from a zip (Tomba!).
+Not yet confirmed on real hardware: game pads, save states, memory
+cards, high resolution, F11 full screen, a real BIOS, .chd images.
+
 ## r26-riscos7test (2026-10-18)
 - Fixed: a game stayed open after it was closed or failed to load (the
   core's retro_unload_game does nothing), so an unpacked game couldn't be

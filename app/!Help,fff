@@ -6,9 +6,10 @@ This is its libretro core with a native RISC OS desktop frontend: a
 window you can drag disc images onto, full screen, sound through
 SharedSound, the keyboard and USB game pads.
 
-This is a TEST BUILD: it writes a log to <Wimp$ScrapDir>.pcsxlog (the
-icon bar menu's "Log..." opens it). Please include it when reporting a
-problem.
+If something goes wrong, PCSX can write a log to <Wimp$ScrapDir>.pcsxlog:
+take the | off the "Set PCSX$LogOn 1" line in !PCSX.!Run, run PCSX
+again, and the icon bar menu's "Log..." opens it. Please include it when
+reporting a problem.
 
 
 Requirements
