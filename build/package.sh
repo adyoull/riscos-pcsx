@@ -46,8 +46,8 @@ cat > "$APP/docs/Source,fff" <<EOT
 PCSX ReARMed: https://github.com/notaz/pcsx_rearmed at commit
 $UPSTREAM_COMMIT, with the patches in Patches (git am, in order).
 The RISC OS port's repository (build scripts, these patches, tests) is
-riscos-pcsx by Andrew Youll; its source is in riscos-pcsx-source.tar.gz
-next to this release, or ask the author.
+https://github.com/adyoull/riscos-pcsx (the release page there also
+has the patched PCSX ReARMed source as one archive).
 
 Built with riscos-crossdev $CROSSDEV_TAG (GCCSDK GCC 10.2, UnixLib).
 EOT

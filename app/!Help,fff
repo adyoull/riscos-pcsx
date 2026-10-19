@@ -142,8 +142,8 @@ frame skipping, high resolution rendering, ...) are all there.
 
 Speed
 -----
-The dynamic recompiler and the NEON renderer are what make it fast. The
-title bar shows the emulated frame rate (test builds): 60, or 50 for a
+The dynamic recompiler and the NEON renderer are what make it fast. With
+the log on, the title bar shows the emulated frame rate: 60, or 50 for a
 PAL game, means full speed. If a game is too slow, try
 pcsx_rearmed_frameskip_type: auto. If a game misbehaves, try
 pcsx_rearmed_drc: disabled (much slower) to see if the recompiler is to
