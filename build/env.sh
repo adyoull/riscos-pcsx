@@ -1,5 +1,5 @@
 # Settings for build.sh and package.sh. Source it.
-VERSION=r26-riscos1
+VERSION=r26-riscos2test1
 # PCSX ReARMed (github.com/notaz/pcsx_rearmed), master on 2026-10-03
 UPSTREAM_URL=https://github.com/notaz/pcsx_rearmed.git
 UPSTREAM_COMMIT=8b6c1635

@@ -49,6 +49,16 @@ pad2.type: standard
 # --- Joysticks (USBJoystick) ------------------------------------------
 # The first two pads found are players 1 and 2. A hat or D-pad is the
 # PlayStation D-pad; without one the left stick is (on a standard pad).
+# joy.api: how pads are read.
+#   auto        (the default) Joystick_Read, the API in the PRM, which any
+#               Joystick module has; plus USBJoystick's newer calls when
+#               they're there, for the hat, the right stick and the pad's
+#               name. Those calls are still a draft: if they don't answer
+#               as expected, PCSX logs it and uses Joystick_Read alone.
+#   stable      Joystick_Read only (no hat or right stick: the D-pad is
+#               the stick).
+#   usbjoystick the newer calls (as auto).
+joy.api: auto
 # joy.buttons maps the pad's button numbers (0 = first) to PlayStation
 # buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 select start.
 # joy.log: 1 = log each button press with its number, to find them.

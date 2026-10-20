@@ -6,7 +6,7 @@ SRC=$1; RCD=$2; HERE=$(cd "$(dirname "$0")" && pwd); OUT=${OUT:-/tmp/pcsx-fake}
 FE=$SRC/frontend/riscos; F=$RCD/fake
 mkdir -p "$OUT"
 arm-linux-gnueabihf-gcc -g -O1 -Wall -funsigned-char -D__riscos -D__FAKE_RISCOS \
-  -I"$F" -I"$FE" -no-pie -o "$OUT/test_plat" "$HERE/test_plat.c" "$FE/plat_riscos.c" "$F/riscos.c"
+  -I"$F" -I"$FE" -no-pie -o "$OUT/test_plat" "$HERE/test_plat.c" "$FE/plat_riscos.c" "$FE/choices.c" "$F/riscos.c"
 PATH=$RCD/toolchain/env/bin:$PATH "$RCD/qemu/aligntrap.sh" "$OUT/test_plat" 2>"$OUT/test_plat.log" | tail -1
 grep -E "^FAIL" "$OUT/test_plat.log" && exit 1 || true
 arm-linux-gnueabihf-gcc -g -O1 -Wall -funsigned-char -D__riscos -D__FAKE_RISCOS \

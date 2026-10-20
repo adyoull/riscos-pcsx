@@ -1,5 +1,19 @@
 # Changelog
 
+## r26-riscos2test1 (2026-10-20)
+- Joysticks: Joystick_Read, the API in the PRM, is now the baseline:
+  sticks 0 and 1 (two players), the 16-bit read (32 buttons), else the
+  8-bit one; the first read's X=0 Y=0 counts as centred. USBJoystick's
+  newer calls (Joystick_Enumerate, _DeviceInfo, _AxisInfo, _AxisValues),
+  which are still a draft, are used on top when present (hat, right
+  stick, name). Their answers are checked (errors, record sizes, counts);
+  if one doesn't fit, PCSX logs it and uses Joystick_Read from then on.
+  Before, a module without the newer calls only gave stick 0.
+- Choices: joy.api auto (default), stable (Joystick_Read only) or
+  usbjoystick. "Reload choices" applies it.
+- Tests: test_plat 520 (the stable API alone, 8-bit fallback, joy.api
+  stable, and the newer calls failing three ways).
+
 ## r26-riscos1 (2026-10-19): first release
 The riscos7test program, with the log off (take the | off "Set
 PCSX$LogOn 1" in !Run for one) and !Help no longer calling it a test

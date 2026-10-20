@@ -7,3 +7,4 @@
 0007-RISC-OS-games-library-window.patch
 0008-RISC-OS-play-games-in-.zip-and-.7z-files.patch
 0009-RISC-OS-close-the-disc-when-a-game-is-unloaded-Clone.patch
+0010-RISC-OS-joysticks-through-Joystick_Read-USBJoystick-.patch

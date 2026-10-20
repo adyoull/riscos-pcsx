@@ -78,6 +78,7 @@ int host_setting_int(const char *k, int d) { return choices_get_int(k, d); }
 void plat_audio_pause(int p) { paused_audio = p; }
 int plat_audio_queued(void) { return -1; }
 int plat_key_down(int k) { (void)k; return 0; }
+void plat_joy_reset(void) {}
 unsigned plat_time_cs(void) { unsigned t; _swix(OS_ReadMonotonicTime, _OUT(0), &t); return t; }
 unsigned plat_time_us(void) { return plat_time_cs() * 10000u; }
 void plat_log(const char *fmt, ...) { (void)fmt; }

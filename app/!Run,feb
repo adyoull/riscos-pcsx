@@ -42,8 +42,8 @@ IfThere <Choices$Write>.PCSX.Choices Then Else Copy <PCSX$Dir>.Resources.UserCho
 
 | --- Logging ----------------------------------------------------------
 | For a log in <Wimp$ScrapDir>.pcsxlog (useful when reporting a
-| problem), take the | off the next line.
-| Set PCSX$LogOn 1
+| problem), keep the next line; put a | in front of it for no log.
+Set PCSX$LogOn 1
 Unset PCSX$Log
 If "<PCSX$LogOn>"<>"" Then Set PCSX$Log /|<Wimp$ScrapDir>/pcsxlog
 Unset PCSX$LogOn

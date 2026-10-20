@@ -10,7 +10,8 @@ RISC OS 5, with a native desktop frontend: `!PCSX`.
   icon bar, a window you drag disc images onto, full screen, menus, frames
   plotted from a 32bpp sprite the core draws into, sound through
   SharedSoundBuffer/StreamManager, keyboard (OS_Byte 121 scans), USB game
-  pads through USBJoystick, save states, a Choices file.
+  pads (Joystick_Read, the PRM's API, with USBJoystick's newer calls on
+  top when present), save states, a Choices file.
 
 Licence: GPL-2.0-or-later, as PCSX ReARMed. AI (Anthropic's Claude) has been
 used as a coding assistant on this port.

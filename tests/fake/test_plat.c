@@ -93,15 +93,17 @@ static struct uj_axis_info j_axes[5] = {
 };
 static struct { int32_t v; uint32_t pad; } j_vals[6];      /* 8-byte values */
 static uint32_t j_buttons;
-static int j_unplugged, j_enum_calls;
+static int j_unplugged, j_enum_calls, j_values_fail, j_axisinfo_small;
+static const _kernel_oserror j_err = { 0x43F00, "Draft call changed" };
 
 static const _kernel_oserror *joy(int swi, int r[10])
 {
 	switch (swi) {
 	case 0x43F44: r[0] = (int)j_mask; r[1] = (int)j_gen; j_enum_calls++; break;
 	case 0x43F45: r[2] = (int)&j_dev; break;
-	case 0x43F46: r[1] = sizeof j_axes[0]; r[2] = 5; r[3] = (int)j_axes; break;
+	case 0x43F46: r[1] = j_axisinfo_small ? 12 : (int)sizeof j_axes[0]; r[2] = 5; r[3] = (int)j_axes; break;
 	case 0x43F47:
+		if (j_values_fail) return &j_err;
 		if (j_unplugged) { r[3] = 0; break; }
 		r[1] = sizeof j_vals[0]; r[2] = 5; r[3] = (int)j_vals; r[4] = (int)j_buttons;
 		break;
@@ -109,15 +111,30 @@ static const _kernel_oserror *joy(int swi, int r[10])
 	return NULL;
 }
 
-/* only Joystick_Read */
-static unsigned jr_pos, jr_buttons;
+/* Joystick_Read, the stable API: sticks 0 and 1 */
+static unsigned jr_pos[2], jr_buttons[2], jr_calls, jr_sticks = 2, jr_no16;
+static int jr_8bit[2];
+static const _kernel_oserror jr_bad = { 0x43F01, "Bad joystick number" };
 static const _kernel_oserror *joy_read(int swi, int r[10])
 {
+	int stick = r[0] & 0xff, reason = (r[0] >> 8) & 0xff;
 	(void)swi;
-	CHECK(r[0] == 256, "Joystick_Read: 16-bit, stick 0");
-	r[0] = (int)jr_pos;
-	r[1] = (int)jr_buttons;
+	jr_calls++;
+	CHECK((r[0] & ~0x1ff) == 0, "Joystick_Read: reason 0 or 1, no other bits");
+	if (stick >= (int)jr_sticks || (reason == 1 && jr_no16))
+		return &jr_bad;
+	if (reason == 1) {
+		r[0] = (int)jr_pos[stick];
+		r[1] = (int)jr_buttons[stick];
+	} else
+		r[0] = jr_8bit[stick];
 	return NULL;
+}
+
+static const _kernel_oserror *joy_enum_fail(int swi, int r[10])
+{
+	(void)swi; (void)r;
+	return &j_err;
 }
 
 /* ---- keys ---- */
@@ -295,6 +312,68 @@ int main(void)
 	n = plat_joy_poll(js, 2);
 	CHECK(js[0].has_hat && js[0].hat_x == -1 && js[0].hat_y == 1, "hat left-down");
 	CHECK(!js[0].has_rstick, "no right stick without RZ");
+
+	/* --- joy.api: stable: Joystick_Read even with the newer calls there --- */
+	choices_set("joy.api", "stable");
+	plat_joy_reset();
+	j_enum_calls = 0;
+	jr_pos[0] = 0;                      /* the PRM: the first read is X=0 Y=0 */
+	jr_pos[1] = 0xFFFF8000u;            /* stick 1: full right, centred Y */
+	jr_buttons[1] = 0x80000001u;        /* 32 buttons */
+	n = plat_joy_poll(js, 2);
+	CHECK(n == 2 && j_enum_calls == 0, "stable: two sticks, newer calls not used");
+	CHECK(js[0].x == 0 && js[0].y == 0, "the first read's 0,0 is centred, not a corner");
+	CHECK(js[1].x == 32767 && js[1].y == 0 && js[1].buttons == 0x80000001u, "stick 1, 32 buttons");
+	CHECK(!js[0].has_hat && !js[0].has_rstick, "no hat or right stick from the stable API");
+	jr_pos[0] = 0x8000FFFFu;            /* up */
+	n = plat_joy_poll(js, 2);
+	CHECK(js[0].y == -32767 && js[0].x == 0, "Y 65535 is up");
+	n = plat_joy_poll(js, 1);
+	CHECK(n == 1, "stable: max respected");
+
+	/* --- auto, but the newer calls misbehave: Joystick_Read from then on --- */
+	choices_set("joy.api", "auto");
+	plat_joy_reset();
+	j_values_fail = 1;
+	j_enum_calls = 0;
+	n = plat_joy_poll(js, 2);
+	CHECK(n == 2 && !strcmp(js[0].name, "Joystick 0"), "AxisValues error: stable, same poll");
+	CHECK(js[0].y == -32767, "and read through Joystick_Read");
+	j_values_fail = 0;
+	fake_advance(101);
+	j_gen++;
+	{
+		unsigned e = j_enum_calls;
+		n = plat_joy_poll(js, 2);
+		CHECK(j_enum_calls == e && !strcmp(js[0].name, "Joystick 0"), "the newer calls not tried again");
+	}
+	/* AxisInfo records smaller than expected */
+	plat_joy_reset();
+	j_axisinfo_small = 1;
+	n = plat_joy_poll(js, 2);
+	CHECK(n == 2 && !strcmp(js[0].name, "Joystick 0"), "short AxisInfo records: stable");
+	j_axisinfo_small = 0;
+	/* Enumerate itself failing */
+	plat_joy_reset();
+	fake_swi(0x43F44, "Joystick_Enumerate", joy_enum_fail);
+	n = plat_joy_poll(js, 2);
+	CHECK(n == 2 && !strcmp(js[0].name, "Joystick 0"), "Enumerate error: stable");
+
+	/* --- a module with only Joystick_Read, one stick, no 16-bit read --- */
+	fake_reset();
+	fake_swi(0x43F40, "Joystick_Read", joy_read);
+	fake_advance(1000);
+	choices_set("joy.api", "usbjoystick");    /* asked for, not there: stable anyway */
+	plat_joy_reset();
+	jr_sticks = 1;
+	jr_no16 = 1;
+	jr_8bit[0] = (0x05 << 16) | (0x81 << 8) | 0x7F;   /* buttons 0,2; X -127; Y +127 (up) */
+	n = plat_joy_poll(js, 2);
+	CHECK(n == 1, "one stick (stick 1 is an error)");
+	CHECK(js[0].x == -32767 && js[0].y == -32767 && js[0].buttons == 5, "8-bit read: left, up, buttons");
+	jr_8bit[0] = (64 << 8) | (unsigned char)-64;          /* a digital stick: +-64 */
+	n = plat_joy_poll(js, 2);
+	CHECK(js[0].x == 64 * 32767 / 127 && js[0].y == 64 * 32767 / 127, "digital +-64: past the dead zone");
 
 	return fake_done("test_plat");
 }

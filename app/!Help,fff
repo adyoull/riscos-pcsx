@@ -129,6 +129,13 @@ if you set pad1.type to analog or dualshock in Choices. Pads differ in
 how they number their buttons: set joy.log to 1, press each button, and
 read the numbers in the log; then set joy.buttons to match.
 
+Pads are read with Joystick_Read, the joystick API in the PRM, which
+works with any Joystick module. USBJoystick's newer calls, which give
+the hat, the right stick and the pad's name, are used as well when
+they're there. They're still a draft, so if they ever don't answer as
+expected PCSX falls back to Joystick_Read (and says so in the log).
+"joy.api: stable" in Choices uses Joystick_Read alone.
+
 
 Choices
 -------

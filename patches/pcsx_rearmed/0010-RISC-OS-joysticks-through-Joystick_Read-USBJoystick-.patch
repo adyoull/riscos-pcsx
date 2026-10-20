@@ -1,0 +1,317 @@
+From f11a6132815dee7272c8b1d0312d6ef9db469a6c Mon Sep 17 00:00:00 2001
+From: Andrew Youll <adyoull@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 08:20:00 +0100
+Subject: [PATCH] RISC OS: joysticks through Joystick_Read, USBJoystick's newer
+ calls on top
+
+Joystick_Read (the PRM's API) is the baseline: sticks 0 and 1, the
+16-bit read, else the 8-bit one. USBJoystick's newer calls (still a
+draft) add the hat, the right stick and the name when present; their
+answers are checked and, if one doesn't fit, Joystick_Read is used from
+then on. Choices joy.api: auto, stable or usbjoystick.
+---
+ frontend/riscos/plat_riscos.c | 188 +++++++++++++++++++++++++++-------
+ frontend/riscos/rofe.h        |   1 +
+ frontend/riscos/wimp.c        |   1 +
+ 3 files changed, 151 insertions(+), 39 deletions(-)
+
+diff --git a/frontend/riscos/plat_riscos.c b/frontend/riscos/plat_riscos.c
+index a8b8ad3c..38d2f6e4 100644
+--- a/frontend/riscos/plat_riscos.c
++++ b/frontend/riscos/plat_riscos.c
+@@ -8,9 +8,12 @@
+  * BufferStats' added - played (which some versions count in blocks) for
+  * how much is still to play.
+  *
+- * Joysticks: USBJoystick 0.23+'s own API (Joystick_Enumerate,
+- * _DeviceInfo, _AxisInfo, _AxisValues), as in the YSFlight port; any
+- * other Joystick module through Joystick_Read (stick 0 only).
++ * Joysticks: the stable API, Joystick_Read (the PRM's; sticks 0 and 1,
++ * 16-bit, else 8-bit), works with any Joystick module. USBJoystick 0.23+'s
++ * newer calls (Joystick_Enumerate, _DeviceInfo, _AxisInfo, _AxisValues;
++ * still a draft) are used on top when present, for the hat, the right
++ * stick and the name, and dropped for Joystick_Read if they misbehave.
++ * Choices: joy.api auto (default), stable or usbjoystick.
+  *
+  * Copyright (C) 2026 Andrew Youll. GPL-2.0-or-later, as PCSX ReARMed.
+  */
+@@ -265,13 +268,41 @@ struct joy_dev {
+ 	char name[64];
+ };
+ 
+-static int joy_mode = -1;      /* -1 not looked, 0 none, 1 USBJoystick, 2 Joystick_Read */
++/* Which API: the stable one (Joystick_Read, in the PRM) always works
++   with any Joystick module; USBJoystick's newer calls (Joystick_Enumerate
++   and the rest, still a draft) add the hat, the right stick and the pad's
++   name. They're used when present ("joy.api: auto", the default) unless
++   they answer in a way that doesn't fit: then PCSX says so in the log and
++   uses Joystick_Read from then on. "joy.api: stable" never uses them. */
++enum { JM_UNKNOWN = -1, JM_NONE, JM_DRAFT, JM_STABLE };
++static int joy_mode = JM_UNKNOWN;
++static int draft_failed;       /* the newer calls misbehaved: not again */
++static int stable_reason = 1;  /* Joystick_Read 1 (16-bit); 0 (8-bit) if 1 isn't there */
+ static struct joy_dev joys[ROFE_MAX_PADS];
+ static int njoys;
+ static uint32_t joy_mask, joy_gen;
+ static unsigned joy_next_scan;
+ static int scanned;
+ 
++static void draft_fail(const char *what, const _kernel_oserror *e)
++{
++	plat_log("Joystick: USBJoystick's newer calls didn't answer as expected (%s%s%s): "
++	         "using Joystick_Read from now on\n", what, e ? ": " : "", e ? e->errmess : "");
++	draft_failed = 1;
++	joy_mode = JM_UNKNOWN;     /* decided again: stable */
++	njoys = 0;
++}
++
++void plat_joy_reset(void)
++{
++	joy_mode = JM_UNKNOWN;
++	draft_failed = 0;
++	stable_reason = 1;
++	njoys = 0;
++	scanned = 0;
++	joy_next_scan = plat_time_cs();
++}
++
+ static void joy_setup(struct joy_dev *d)
+ {
+ 	_kernel_swi_regs r;
+@@ -292,14 +323,27 @@ static void joy_setup(struct joy_dev *d)
+ 	r.r[0] = d->slot;
+ 	if (_kernel_swi(UJ_DeviceInfo | 0x20000, &r, &r) == NULL && r.r[2]) {
+ 		dev = (const struct uj_device_info *)r.r[2];
+-		if (dev->product && dev->product[0])
+-			snprintf(d->name, sizeof d->name, "%s", dev->product);
+-		d->nbuttons = (int)dev->num_buttons;
++		/* only a record at least as big as the one this was written for */
++		if (dev->size >= sizeof *dev) {
++			if (dev->product && dev->product[0])
++				snprintf(d->name, sizeof d->name, "%s", dev->product);
++			d->nbuttons = (int)dev->num_buttons;
++		}
+ 	}
+ 	r.r[0] = d->slot;
+-	if (_kernel_swi(UJ_AxisInfo | 0x20000, &r, &r) != NULL || r.r[3] == 0 ||
+-	    r.r[1] < (int)sizeof(struct uj_axis_info))
++	{
++		const _kernel_oserror *e = _kernel_swi(UJ_AxisInfo | 0x20000, &r, &r);
++		if (e != NULL) {
++			draft_fail("Joystick_AxisInfo", e);
++			return;
++		}
++	}
++	if (r.r[3] == 0)
++		return;                 /* (gone since Enumerate) */
++	if (r.r[1] < (int)sizeof(struct uj_axis_info) || r.r[2] < 0 || r.r[2] > 64) {
++		draft_fail("Joystick_AxisInfo's records", NULL);
+ 		return;
++	}
+ 	rec_size = r.r[1];
+ 	naxes = r.r[2];
+ 	rec = (const unsigned char *)r.r[3];
+@@ -339,39 +383,66 @@ static void joy_setup(struct joy_dev *d)
+ 	         d->ax[2] >= 0 ? ", right stick" : "");
+ }
+ 
++static int joy_api_choice(void)     /* 0 auto, 1 stable, 2 usbjoystick */
++{
++	const char *v = choices_get("joy.api");
++	if (v && !strcmp(v, "stable"))
++		return 1;
++	if (v && !strcmp(v, "usbjoystick"))
++		return 2;
++	return 0;
++}
++
+ static void joy_scan(void)
+ {
+ 	_kernel_swi_regs r;
++	const _kernel_oserror *e;
+ 	int slot;
+ 
+-	if (joy_mode <= 0) {      /* (looked again each second until there is one) */
+-		int was = joy_mode;
+-		if (swi_exists("Joystick_Enumerate"))
+-			joy_mode = 1;
+-		else if (swi_exists("Joystick_Read"))
+-			joy_mode = 2;
++	if (joy_mode <= JM_NONE) {  /* (looked again each second until there is one) */
++		int was = joy_mode, choice = joy_api_choice();
++		int has_draft = swi_exists("Joystick_Enumerate");
++		int has_read = swi_exists("Joystick_Read");
++		if (has_draft && choice != 1 && !draft_failed)
++			joy_mode = JM_DRAFT;
++		else if (has_read)
++			joy_mode = JM_STABLE;
+ 		else
+-			joy_mode = 0;
+-		if (joy_mode != was)
+-			plat_log("Joystick: %s\n", joy_mode == 1 ? "USBJoystick" :
+-		         joy_mode == 2 ? "Joystick_Read (stick 0)" : "no Joystick module");
++			joy_mode = JM_NONE;
++		if (joy_mode != was) {
++			if (choice == 2 && joy_mode != JM_DRAFT)
++				plat_log("Joystick: joy.api usbjoystick, but USBJoystick's newer calls "
++				         "aren't there or failed\n");
++			plat_log("Joystick: %s\n", joy_mode == JM_DRAFT ?
++			         "USBJoystick's newer calls (Joystick_Enumerate...); joy.api: stable turns them off" :
++			         joy_mode == JM_STABLE ? "Joystick_Read (the PRM's API), sticks 0 and 1" :
++			         "no Joystick module");
++		}
++		scanned = 0;
+ 	}
+-	if (joy_mode != 1)
++	if (joy_mode != JM_DRAFT)
+ 		return;
+-	if (_kernel_swi(UJ_Enumerate | 0x20000, &r, &r) != NULL)
++	if ((e = _kernel_swi(UJ_Enumerate | 0x20000, &r, &r)) != NULL) {
++		draft_fail("Joystick_Enumerate", e);
++		joy_scan();
+ 		return;
++	}
+ 	if ((uint32_t)r.r[0] == joy_mask && (uint32_t)r.r[1] == joy_gen && scanned)
+ 		return;
+ 	scanned = 1;
+ 	joy_mask = (uint32_t)r.r[0];
+ 	joy_gen = (uint32_t)r.r[1];
+ 	njoys = 0;
+-	for (slot = 0; slot < 32 && njoys < ROFE_MAX_PADS; slot++)
++	for (slot = 0; slot < 32 && njoys < ROFE_MAX_PADS && !draft_failed; slot++)
+ 		if (joy_mask & (1u << slot)) {
+ 			joys[njoys].slot = slot;
+ 			joy_setup(&joys[njoys]);
+ 			njoys++;
+ 		}
++	if (draft_failed) {
++		joy_scan();
++		return;
++	}
+ 	if (njoys == 0)
+ 		plat_log("Joystick: none attached\n");
+ }
+@@ -392,31 +463,59 @@ static int norm(int32_t v, int32_t min, int32_t mid, int32_t max)
+ 	return n > 32767 ? 32767 : n < -32767 ? -32767 : (int)n;
+ }
+ 
++/* The stable API: stick N with Joystick_Read. 1 = read, 0 = no stick. */
++static int stable_read(int stick, struct joy_state *s)
++{
++	_kernel_swi_regs r;
++	memset(s, 0, sizeof *s);
++	r.r[0] = stable_reason << 8 | stick;
++	if (_kernel_swi(UJ_Read | 0x20000, &r, &r) != NULL) {
++		if (stable_reason != 1 || stick != 0)
++			return 0;
++		/* a module without the 16-bit read: the 8-bit one */
++		r.r[0] = stick;
++		if (_kernel_swi(UJ_Read | 0x20000, &r, &r) != NULL)
++			return 0;
++		stable_reason = 0;
++		plat_log("Joystick: Joystick_Read 1 (16-bit) not there, using Joystick_Read 0\n");
++	}
++	s->present = 1;
++	snprintf(s->name, sizeof s->name, "Joystick %d", stick);
++	if (stable_reason == 1) {
++		unsigned pos = (unsigned)r.r[0];
++		/* the very first read gives X=0 Y=0 (the PRM): centred, not a corner */
++		if (pos != 0) {
++			s->x = norm((pos >> 16) & 0xffff, 0, 32768, 65535);
++			s->y = -norm(pos & 0xffff, 0, 32768, 65535);   /* 65535 is up */
++		}
++		s->buttons = (uint32_t)r.r[1];
++	} else {
++		int y = (signed char)(r.r[0] & 0xff), x = (signed char)((r.r[0] >> 8) & 0xff);
++		s->x = x * 32767 / 127;
++		s->y = -y * 32767 / 127;                           /* +127 is up */
++		s->buttons = ((uint32_t)r.r[0] >> 16) & 0xff;
++	}
++	return 1;
++}
++
+ int plat_joy_poll(struct joy_state *js, int max)
+ {
+ 	unsigned now = plat_time_cs();
+ 	int i, n = 0;
+ 
+-	if (joy_mode < 0 || (int)(now - joy_next_scan) >= 0) {
++	if (joy_mode == JM_UNKNOWN || (int)(now - joy_next_scan) >= 0) {
+ 		joy_scan();
+ 		joy_next_scan = now + 100;          /* look for new pads each second */
+ 	}
+-	if (joy_mode == 2 && max > 0) {
+-		_kernel_swi_regs r;
+-		r.r[0] = 256;                       /* 16-bit read, stick 0 */
+-		if (_kernel_swi(UJ_Read | 0x20000, &r, &r) == NULL) {
+-			unsigned pos = (unsigned)r.r[0];
+-			js[0].present = 1;
+-			js[0].x = norm((pos >> 16) & 0xffff, 0, 32768, 65535);
+-			/* UJ_Read: Y is 65535 at the top */
+-			js[0].y = -norm(pos & 0xffff, 0, 32768, 65535);
+-			js[0].buttons = (uint32_t)r.r[1];
+-			snprintf(js[0].name, sizeof js[0].name, "Joystick");
+-			return 1;
+-		}
+-		return 0;
++	if (joy_mode == JM_STABLE) {
++		for (i = 0; i < max && i < ROFE_MAX_PADS; i++)
++			if (stable_read(i, &js[n]))
++				n++;
++			else
++				break;
++		return n;
+ 	}
+-	if (joy_mode != 1)
++	if (joy_mode != JM_DRAFT)
+ 		return 0;
+ 	for (i = 0; i < njoys && n < max; i++) {
+ 		struct joy_dev *d = &joys[i];
+@@ -428,8 +527,19 @@ int plat_joy_poll(struct joy_state *js, int max)
+ 		memset(s, 0, sizeof *s);
+ 		snprintf(s->name, sizeof s->name, "%s", d->name);
+ 		r.r[0] = d->slot;
+-		if (_kernel_swi(UJ_AxisValues | 0x20000, &r, &r) != NULL || r.r[3] == 0)
++		{
++			const _kernel_oserror *e = _kernel_swi(UJ_AxisValues | 0x20000, &r, &r);
++			if (e != NULL) {
++				draft_fail("Joystick_AxisValues", e);
++				return plat_joy_poll(js, max);   /* again, the stable way */
++			}
++		}
++		if (r.r[3] == 0)
+ 			continue;                       /* unplugged: centred, released */
++		if (r.r[1] < 4 || r.r[2] < 0 || r.r[2] > 64) {
++			draft_fail("Joystick_AxisValues' values", NULL);
++			return plat_joy_poll(js, max);
++		}
+ 		vsize = r.r[1];
+ 		naxes = r.r[2];
+ 		val = (const unsigned char *)r.r[3];
+diff --git a/frontend/riscos/rofe.h b/frontend/riscos/rofe.h
+index 13d7ca2a..55565970 100644
+--- a/frontend/riscos/rofe.h
++++ b/frontend/riscos/rofe.h
+@@ -61,6 +61,7 @@ struct joy_state {
+ 	char name[64];
+ };
+ int plat_joy_poll(struct joy_state *js, int max);   /* returns how many */
++void plat_joy_reset(void);   /* decide the joystick API again (joy.api changed) */
+ 
+ /* ---- host.c: what wimp.c (or the test) calls ---- */
+ struct host_video {
+diff --git a/frontend/riscos/wimp.c b/frontend/riscos/wimp.c
+index 6dc7ffbc..d33d08a8 100644
+--- a/frontend/riscos/wimp.c
++++ b/frontend/riscos/wimp.c
+@@ -795,6 +795,7 @@ static void load_ro_path(const char *ro_path)
+ 
+ static void reload_choices(void)
+ {
++	plat_joy_reset();
+ 	apply_choices(host_game_loaded() ? game_path : NULL);
+ }
+ 
+-- 
+2.43.0
+
