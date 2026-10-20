@@ -16,6 +16,16 @@ RISC OS 5, with a native desktop frontend: `!PCSX`.
 Licence: GPL-2.0-or-later, as PCSX ReARMed. AI (Anthropic's Claude) has been
 used as a coding assistant on this port.
 
+## Screenshots
+
+Crash Bandicoot in a desktop window on a Raspberry Pi 4, and the games library:
+
+![Crash Bandicoot](docs/screenshots/crash-bandicoot-1.jpg)
+
+![Crash Bandicoot](docs/screenshots/crash-bandicoot-2.jpg)
+
+![The games library](docs/screenshots/games-library.jpg)
+
 ## Layout
 
 | Path | What |

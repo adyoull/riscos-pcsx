@@ -1,5 +1,16 @@
 # Changelog
 
+## r26-riscos2 (2026-10-20)
+The riscos2test1 program with the log off. New since r26-riscos1:
+joysticks are read with Joystick_Read, the PRM's API (two sticks, 16-bit
+with 32 buttons, else 8-bit), with USBJoystick's newer calls on top when
+present (hat, right stick, name) and dropped if they answer unexpectedly;
+Choices joy.api (auto, stable, usbjoystick). Screenshots in
+docs/screenshots.
+
+Seen on a Pi 4 since r26-riscos1: Crash Bandicoot (NTSC-U) at full speed
+in a window, with a save state made; the games library with two games.
+
 ## r26-riscos2test1 (2026-10-20)
 - Joysticks: Joystick_Read, the API in the PRM, is now the baseline:
   sticks 0 and 1 (two players), the 16-bit read (32 buttons), else the
